@@ -1,0 +1,63 @@
+from __future__ import annotations
+from dataclasses import dataclass, field
+from typing import Any
+import numpy as np
+
+@dataclass
+class TemporalSegment:
+    segment_id: int
+    timestamp_start: float          # seconds
+    timestamp_end: float
+    segment_type: str               # "activity" | "idle" | "erasure"
+    delta_magnitude: float          # SSIM-based change score
+    keyframe_before: np.ndarray     # stable frame before activity
+    keyframe_after: np.ndarray      # stable frame after activity
+
+@dataclass
+class DetectedRegion:
+    mark_id: int                    # SoM label number
+    bbox: tuple[int,int,int,int]    # x, y, w, h
+    shape_type: str                 # rectangle, diamond, oval, circle, triangle, other
+    centroid: tuple[int, int]       # x, y
+    contour: np.ndarray
+    first_seen: float               # timestamp when first detected (seconds)
+
+@dataclass
+class ElementRegistry:
+    """Persistent map of mark_id → DetectedRegion across the video.
+    Provides mark ID stability: same element keeps same ID across frames."""
+    elements: dict[int, DetectedRegion] = field(default_factory=dict)
+    next_id: int = 1
+
+    def update(self, new_detections: list, timestamp: float) -> None:
+        """Match new detections to existing elements by centroid proximity.
+        New elements get fresh IDs. Missing elements are marked retired."""
+        ...
+
+@dataclass
+class VLMOperation:
+    """One operation from VLM analysis of the marked video."""
+    operation_id: int
+    operation_type: str             # CREATION | ADDITION | HIGHLIGHTING | ERASURE | COMPLETE_ERASURE
+    timestamp_start: str            # MM:SS
+    timestamp_end: str              # MM:SS
+    confidence: str                 # high | medium | low
+    marks_involved: list[int]       # mark IDs created/modified/removed
+    per_mark_descriptions: dict[int, dict]  # mark_id → {text, element_type, semantic_role}
+    connections: list[dict]         # {from_mark, to_mark, direction, label, line_type}
+    classification_reasoning: dict
+    pedagogical_context: str
+    physical_action: dict
+    visual_evidence: dict
+
+@dataclass
+class GroundedElement:
+    """A DetectedRegion enriched by VLM semantic analysis."""
+    mark_id: int
+    bbox: tuple[int,int,int,int]    # from CV (ElementRegistry)
+    shape: str                      # from CV
+    centroid: tuple[int, int]       # from CV
+    text: str | None                # from VLM
+    element_type: str               # node | connection | annotation (from VLM)
+    connections_to: list[int] = field(default_factory=list)     # mark IDs (from VLM)
+    vlm_description: str = ""           # from VLM
