@@ -9,8 +9,9 @@ Single pass through the ROI-cropped video:
   6. Write marked frames to marked_video.mp4
 
 Outputs:
-  - ElementRegistry (mark_id -> DetectedRegion, persists across video)
+  - ElementRegistry (mark_id -> DetectedRegion, final state after all pen-lifts)
   - list[TemporalSegment] (one per activity window)
+  - list[ElementRegistry] (registry snapshot taken after each pen-lift, parallel to segments)
   - Path to marked_video.mp4
 """
 from __future__ import annotations
@@ -279,11 +280,30 @@ def _classify_segment_type(
 # Main entry point
 # ---------------------------------------------------------------------------
 
+def _snapshot_registry(registry: ElementRegistry) -> ElementRegistry:
+    """Lightweight snapshot of the registry at a pen-lift moment.
+
+    Creates new DetectedRegion objects (so centroid/bbox/shape are frozen)
+    but shares the numpy contour arrays (read-only after creation).
+    """
+    snap = ElementRegistry(next_id=registry.next_id)
+    for mark_id, region in registry.elements.items():
+        snap.elements[mark_id] = DetectedRegion(
+            mark_id=region.mark_id,
+            bbox=region.bbox,
+            shape_type=region.shape_type,
+            centroid=region.centroid,
+            contour=region.contour,
+            first_seen=region.first_seen,
+        )
+    return snap
+
+
 def run(
     cap: cv2.VideoCapture,
     ingest_data: VideoIngest,
     output_dir: Path,
-) -> tuple[ElementRegistry, list[TemporalSegment], Path]:
+) -> tuple[ElementRegistry, list[TemporalSegment], list[ElementRegistry], Path]:
     """Process the full video: temporal segmentation + SoM marking.
 
     Returns:
@@ -306,6 +326,7 @@ def run(
 
     registry = ElementRegistry()
     segments: list[TemporalSegment] = []
+    registry_snapshots: list[ElementRegistry] = []
 
     # Temporal state machine
     is_active = False
@@ -385,6 +406,7 @@ def run(
                         keyframe_after=keyframe_after,
                     )
                     segments.append(seg)
+                    registry_snapshots.append(_snapshot_registry(registry))
                     segment_id += 1
 
                     log.debug(
@@ -411,4 +433,4 @@ def run(
         "Stage 1 done: %d segments, %d active marks, marked video -> %s",
         len(segments), len(registry.elements), marked_video_path,
     )
-    return registry, segments, marked_video_path
+    return registry, segments, registry_snapshots, marked_video_path

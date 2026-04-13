@@ -1,5 +1,6 @@
-  .venv/
-  outputs/
-  __pycache__/
-  *.pyc
-  .env
+.venv/
+outputs/
+__pycache__/
+*.pyc
+.env
+outputs/test_run/
