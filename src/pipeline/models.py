@@ -29,10 +29,67 @@ class ElementRegistry:
     elements: dict[int, DetectedRegion] = field(default_factory=dict)
     next_id: int = 1
 
-    def update(self, new_detections: list, timestamp: float) -> None:
+    def update(
+        self,
+        detections: list[dict],
+        timestamp: float,
+        match_threshold: int = 50,
+    ) -> list[DetectedRegion]:
         """Match new detections to existing elements by centroid proximity.
-        New elements get fresh IDs. Missing elements are marked retired."""
-        ...
+
+        detections: list of dicts with keys: bbox, shape_type, contour, centroid
+        New elements get fresh IDs. Unmatched existing elements are retired.
+        Returns the list of DetectedRegion objects (with IDs resolved).
+        """
+        matched_existing: set[int] = set()
+        result: list[DetectedRegion] = []
+
+        for det in detections:
+            cx, cy = det["centroid"]
+            best_id: int | None = None
+            best_dist = float("inf")
+
+            for mark_id, region in self.elements.items():
+                rx, ry = region.centroid
+                dist = ((cx - rx) ** 2 + (cy - ry) ** 2) ** 0.5
+                if dist < best_dist and dist < match_threshold:
+                    best_dist = dist
+                    best_id = mark_id
+
+            if best_id is not None:
+                matched_existing.add(best_id)
+                region = DetectedRegion(
+                    mark_id=best_id,
+                    bbox=det["bbox"],
+                    shape_type=det["shape_type"],
+                    centroid=det["centroid"],
+                    contour=det["contour"],
+                    first_seen=self.elements[best_id].first_seen,
+                )
+                self.elements[best_id] = region
+                result.append(region)
+            else:
+                region = DetectedRegion(
+                    mark_id=self.next_id,
+                    bbox=det["bbox"],
+                    shape_type=det["shape_type"],
+                    centroid=det["centroid"],
+                    contour=det["contour"],
+                    first_seen=timestamp,
+                )
+                result.append(region)
+                self.next_id += 1
+
+        # Retire elements not matched to any new detection
+        for uid in set(self.elements.keys()) - matched_existing:
+            del self.elements[uid]
+
+        # Register newly created elements
+        for region in result:
+            if region.mark_id not in self.elements:
+                self.elements[region.mark_id] = region
+
+        return result
 
 @dataclass
 class VLMOperation:
