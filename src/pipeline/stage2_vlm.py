@@ -22,6 +22,8 @@ import time
 from pathlib import Path
 
 import google.generativeai as genai
+from google.api_core import exceptions as api_exceptions
+from google.api_core import retry as api_retry
 
 from PIL import Image
 
@@ -399,6 +401,38 @@ def _collect_text(response) -> str:
     return "\n".join(text_parts) or response.text
 
 
+def _send_with_retry(chat, content: list, timeout: int, label: str) -> object:
+    """Send a chat message with a correctly-configured retry deadline.
+
+    The gRPC retry layer has its own total-attempts deadline that defaults to
+    ~120 s and overrides the per-call timeout.  We explicitly set the retry
+    deadline to match our intended timeout so a slow video-inference call
+    doesn't get killed prematurely.
+
+    On DEADLINE_EXCEEDED we retry once more (server-side transient overload).
+    """
+    _retry = api_retry.Retry(
+        initial=2.0,
+        maximum=60.0,
+        multiplier=2.0,
+        deadline=timeout,
+        predicate=api_retry.if_transient_error,
+    )
+    request_options = {"timeout": timeout, "retry": _retry}
+
+    for attempt in range(2):
+        try:
+            return chat.send_message(content, request_options=request_options)
+        except api_exceptions.DeadlineExceeded as exc:
+            if attempt == 0:
+                log.warning(
+                    "Stage 2: %s timed out (attempt 1) — retrying once more...", label
+                )
+            else:
+                raise RuntimeError(
+                    f"Stage 2: {label} exceeded timeout after 2 attempts"
+                ) from exc
+
 
 def run(
     video_path: Path,
@@ -473,10 +507,7 @@ def run(
         log.info("Stage 2: initial analysis (model=%s, keyframes=%d)...",
                  config.VLM_MODEL, len(kf_files))
         chat = model.start_chat()
-        response = chat.send_message(
-            content,
-            request_options={"timeout": config.VLM_TIMEOUT},
-        )
+        response = _send_with_retry(chat, content, config.VLM_TIMEOUT, "initial analysis")
         response_text = _collect_text(response)
         raw = _extract_json(response_text)
         log.info(
@@ -491,10 +522,7 @@ def run(
                 json.dumps(raw, indent=2), keyframes
             )
             v_content = [video_file] + kf_files + [verification_prompt]
-            v_response = chat.send_message(
-                v_content,
-                request_options={"timeout": config.VLM_TIMEOUT},
-            )
+            v_response = _send_with_retry(chat, v_content, config.VLM_TIMEOUT, "verification pass")
             v_text = _collect_text(v_response)
             try:
                 verified_raw = _extract_json(v_text)
