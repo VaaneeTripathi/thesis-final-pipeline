@@ -247,30 +247,68 @@ CRITICAL REQUIREMENTS
 """
 
 
-def _build_analysis_prompt(registry: ElementRegistry) -> str:
+def _keyframe_context(keyframes: list[KeyframeAnnotation]) -> str:
+    """Build the TEMPORAL REFERENCE KEYFRAMES section for the analysis prompt.
+
+    Lists each pen-lift keyframe's timestamp and CV-detected marks. The
+    corresponding PNG images are passed separately in the message content list,
+    giving the VLM both visual and positional grounding at each key moment.
+    """
+    if not keyframes:
+        return ""
+    lines = [
+        "TEMPORAL REFERENCE KEYFRAMES",
+        "Still images of the board at each pen-lift are attached after this video.",
+        "They show the exact board state with numbered SoM marks overlaid.",
+        "Use them to: verify mark IDs match visual elements, confirm board state",
+        "at each pen-lift, and cross-check your operation timestamps.\n",
+    ]
+    for kf in keyframes:
+        lines.append(f"Keyframe {kf.segment_id}  (pen-lift at {kf.timestamp:.1f}s):")
+        for mark in sorted(kf.marks, key=lambda m: m["mark_id"]):
+            cx, cy = mark["centroid"]
+            lines.append(
+                f"  Mark [{mark['mark_id']}]: {mark['shape_type']}  centroid=({cx},{cy})"
+            )
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _build_analysis_prompt(
+    registry: ElementRegistry,
+    keyframes: list[KeyframeAnnotation] | None = None,
+) -> str:
     registry_section = _registry_to_prompt_lines(registry)
+    keyframe_section = _keyframe_context(keyframes or [])
     return (
-        "TASK: Flowchart Operation Detection on SoM-Marked Lecture Video\n\n"
-        "CONTEXT: SET-OF-MARKS PRE-PROCESSING\n"
-        "Every frame of this video has been pre-processed by a computer-vision\n"
-        "pipeline that detected whiteboard elements and overlaid numbered\n"
-        "bounding-box labels (Set-of-Marks). Reference elements by mark number.\n\n"
-        "DETECTED MARKS\n"
+        "TASK: Flowchart Operation Detection on Lecture Video\n\n"
+        "CONTEXT: SET-OF-MARKS SPATIAL GROUNDING\n"
+        "The computer-vision pipeline detected whiteboard elements and assigned\n"
+        "each a numbered mark ID. The original clean video is provided first,\n"
+        "followed by still keyframe images taken at each pen-lift moment with\n"
+        "SoM marks overlaid. Reference ALL elements by mark number.\n\n"
+        "DETECTED MARKS (full registry)\n"
         f"{registry_section}\n\n"
-        f"{_TAXONOMY}\n\n"
+        + (f"{keyframe_section}\n" if keyframe_section else "")
+        + f"{_TAXONOMY}\n\n"
         f"{_ANALYSIS_PROTOCOL}\n\n"
         f"{_FEW_SHOT_EXAMPLE}\n\n"
         f"{_SCHEMA}\n"
     )
 
 
-def _build_verification_prompt(analysis_json: str) -> str:
+def _build_verification_prompt(
+    analysis_json: str,
+    keyframes: list[KeyframeAnnotation] | None = None,
+) -> str:
     """Verification pass prompt (ported from flowchart_analyser.py verify_diagram)."""
+    keyframe_section = _keyframe_context(keyframes or [])
     return (
         "TASK: Verification of Flowchart Operation Analysis\n\n"
-        "You previously analysed this SoM-marked lecture video and produced the\n"
-        "following operation log. Watch the video again and verify it.\n\n"
-        "GENERATED ANALYSIS:\n"
+        "You previously analysed this lecture video and produced the following\n"
+        "operation log. The original video and keyframe stills are provided again.\n\n"
+        + (f"{keyframe_section}\n" if keyframe_section else "")
+        + "GENERATED ANALYSIS:\n"
         f"{analysis_json}\n\n"
         "VERIFICATION CHECKLIST\n"
         "1. Are all operations listed? Are any missing?\n"
@@ -363,19 +401,21 @@ def _collect_text(response) -> str:
 
 
 def run(
-    marked_video_path: Path,
+    video_path: Path,
     registry: ElementRegistry,
     output_dir: Path,
+    keyframes: list[KeyframeAnnotation] | None = None,
     verify: bool = True,
 ) -> list[VLMOperation]:
-    """Upload the marked video to Gemini and parse the operation log.
+    """Upload the original lecture video (+ keyframe stills) to Gemini and parse operations.
 
     Args:
-        marked_video_path: Path to the SoM-marked video from Stage 1.
-        registry: ElementRegistry from Stage 1 (mark IDs + regions).
-        output_dir: Directory for the VLM response cache.
-        verify: If True, run a second verification pass (ported from
-                flowchart_analyser.py) before returning.
+        video_path:  Path to the original clean video (no SoM overlay).
+        registry:    ElementRegistry from Stage 1 (mark IDs + regions).
+        output_dir:  Directory for the VLM response cache.
+        keyframes:   KeyframeAnnotation list from Stage 1. Each PNG is uploaded
+                     alongside the video to give the VLM per-pen-lift grounding.
+        verify:      If True, run a second verification pass before returning.
 
     Returns:
         list[VLMOperation] parsed from the VLM response.
@@ -398,19 +438,43 @@ def run(
 
     model = genai.GenerativeModel(model_name=config.VLM_MODEL)
 
-    log.info("Stage 2: uploading %s to Gemini...", marked_video_path.name)
-    video_file = _upload_with_retry(marked_video_path)
+    log.info("Stage 2: uploading %s to Gemini...", video_path.name)
+    video_file = _upload_with_retry(video_path)
+
+    # Upload keyframe PNGs as separate image files for spatial grounding.
+    # Images are uploaded once and reused across analysis + verification passes.
+    kf_files: list = []
+    if keyframes:
+        log.info("Stage 2: uploading %d keyframe images...", len(keyframes))
+        for kf in keyframes:
+            try:
+                kf_file = genai.upload_file(path=str(kf.image_path))
+                kf_files.append(kf_file)
+                log.debug("Uploaded keyframe %d: %s", kf.segment_id, kf_file.name)
+            except Exception as exc:
+                log.warning(
+                    "Stage 2: failed to upload keyframe %d (%s): %s — skipping",
+                    kf.segment_id, kf.image_path.name, exc,
+                )
+
+    # All uploaded resources tracked for cleanup
+    all_uploaded = [video_file] + kf_files
 
     try:
         log.info("Stage 2: waiting for Gemini video processing...")
         video_file = _wait_for_processing(video_file)
 
-        # --- Initial analysis pass ---
-        analysis_prompt = _build_analysis_prompt(registry)
-        log.info("Stage 2: initial analysis (model=%s)...", config.VLM_MODEL)
+        # Message content: video first, then keyframe stills, then the text prompt.
+        # The model sees them in order — video provides temporal context, keyframes
+        # provide per-moment spatial grounding.
+        analysis_prompt = _build_analysis_prompt(registry, keyframes)
+        content = [video_file] + kf_files + [analysis_prompt]
+
+        log.info("Stage 2: initial analysis (model=%s, keyframes=%d)...",
+                 config.VLM_MODEL, len(kf_files))
         chat = model.start_chat()
         response = chat.send_message(
-            [video_file, analysis_prompt],
+            content,
             request_options={"timeout": config.VLM_TIMEOUT},
         )
         response_text = _collect_text(response)
@@ -420,12 +484,15 @@ def run(
             len(raw.get("operations", [])),
         )
 
-        # --- Verification pass (ported from flowchart_analyser.py) ---
+        # Verification pass 
         if verify:
             log.info("Stage 2: verification pass...")
-            verification_prompt = _build_verification_prompt(json.dumps(raw, indent=2))
+            verification_prompt = _build_verification_prompt(
+                json.dumps(raw, indent=2), keyframes
+            )
+            v_content = [video_file] + kf_files + [verification_prompt]
             v_response = chat.send_message(
-                [video_file, verification_prompt],
+                v_content,
                 request_options={"timeout": config.VLM_TIMEOUT},
             )
             v_text = _collect_text(v_response)
@@ -443,11 +510,13 @@ def run(
                 )
 
     finally:
-        try:
-            genai.delete_file(video_file.name)
-            log.info("Stage 2: deleted uploaded file %s", video_file.name)
-        except Exception as exc:
-            log.warning("Stage 2: failed to delete uploaded file: %s", exc)
+        for uploaded in all_uploaded:
+            try:
+                genai.delete_file(uploaded.name)
+                log.debug("Stage 2: deleted uploaded file %s", uploaded.name)
+            except Exception as exc:
+                log.warning("Stage 2: failed to delete %s: %s", uploaded.name, exc)
+        log.info("Stage 2: cleaned up %d uploaded file(s)", len(all_uploaded))
 
     cache_path.write_text(json.dumps(raw, indent=2))
     log.info("Stage 2: cached response -> %s", cache_path)
