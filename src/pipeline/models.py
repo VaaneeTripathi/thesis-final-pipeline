@@ -1,5 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 import numpy as np
 
@@ -106,6 +107,19 @@ class VLMOperation:
     pedagogical_context: str
     physical_action: dict
     visual_evidence: dict
+
+@dataclass
+class KeyframeAnnotation:
+    """A single annotated keyframe PNG emitted at each pen-lift event.
+
+    Sent to the VLM as a separate image file alongside the clean original video, giving spatial grounding
+    without degrading the video's visual fidelity.
+    """
+    segment_id: int
+    timestamp: float            # seconds — pen-lift moment (segment.timestamp_end)
+    image_path: Path            # written PNG path
+    marks: list[dict]           # [{mark_id, shape_type, centroid, bbox}] at this moment
+
 
 @dataclass
 class GroundedElement:
