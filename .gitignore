@@ -6,3 +6,11 @@ __pycache__/
 outputs/test_run/
 src/pipeline/__pycache__/*
 src/thesis_final_pipeline.egg-info/*
+.venv/
+__pycache__/
+*.pyc
+outputs/
+*.egg-info/
+dist/
+build/
+.pytest_cache/

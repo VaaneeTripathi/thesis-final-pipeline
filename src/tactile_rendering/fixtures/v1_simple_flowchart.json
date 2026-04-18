@@ -1,0 +1,46 @@
+{
+    "id": "2026-04-09T10:00:00Z",
+
+    "elements": {
+        "nodes": [
+            { "id": "n1", "shape": "rectangle", "text": "Computer", "position": { "x": 0, "y": 0 } },
+            { "id": "n2", "shape": "rectangle", "text": "Screen", "position": { "x": -15, "y": -15 } },
+            { "id": "n3", "shape": "rectangle", "text": "Keyboard", "position": { "x": 15, "y": -15 } },
+            { "id": "n4", "shape": "rectangle", "text": "Mouse", "position": { "x": -15, "y": -30 } },
+            { "id": "n5", "shape": "rectangle", "text": "Speakers", "position": { "x": 15, "y": -30 } }
+        ],
+        "connections": [
+            { "id": "c1", "source": "n1", "target": "n2", "direction": "forward" },
+            { "id": "c2", "source": "n1", "target": "n3", "direction": "forward" },
+            { "id": "c3", "source": "n1", "target": "n4", "direction": "forward" },
+            { "id": "c4", "source": "n1", "target": "n5", "direction": "forward" }
+        ]
+    },
+
+    "structure": {
+        "hierarchy": [
+            {
+                "id": "g1",
+                "parent": null,
+                "children": ["n1", "n2", "n3", "n4", "n5"],
+                "label": "Computer System"
+            }
+        ]
+    },
+
+    "state": {
+        "board_state": "Single flowchart on the board, fully expanded, no active annotations"
+    },
+
+    "semantics": {
+        "symbols": null,
+        "annotations": null
+    },
+
+    "provenance": {
+        "model": "hand-authored",
+        "confidence": "high",
+        "visibility_issues": null,
+        "time_taken": "00:00"
+    }
+}

@@ -1,0 +1,21 @@
+[project]
+name = "tactile-rendering"
+version = "0.1.0"
+description = "Tactile rendering pipeline for accessible flowchart IRs"
+requires-python = ">=3.12"
+dependencies = [
+    "jsonschema>=4.20",
+    "pydot>=3.0",
+    "svgwrite>=1.4",
+    "cairosvg>=2.7",
+    "numpy>=1.26",
+    "Pillow>=10.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
