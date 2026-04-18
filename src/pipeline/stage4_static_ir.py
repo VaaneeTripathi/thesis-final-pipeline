@@ -1,249 +1,274 @@
 """Stage 4: Static IR generation (triggered by Mealy S output).
 
-Merges CV geometry (ElementRegistry — positions, shapes, bboxes) with
-VLM semantics (VLMOperation list — text, connections, roles) to produce
-a dict conforming to static-schema.json.
+Merges CV geometry (ElementRegistry — positions, bboxes, CV-detected shapes)
+with VLM semantics (BoardSnapshot — text, shape verification, connections,
+hierarchy, symbol meanings, annotations) to produce a dict conforming to
+static-schema.json.
 
-The registry contains the board state at pen-lift; operations contains
-all VLM operations up to and including the current one so we can build
-the latest known description for every mark.
+Design contract:
+  - CV registry  = ground truth for geometry (positions, bounding boxes)
+  - BoardSnapshot = ground truth for semantics (text, shapes, connections, meaning)
+  - Where they disagree on shape: VLM wins (it sees context); discrepancy is logged
+  - Where VLM references a mark not in registry: skip it (hallucination guard)
+
+Node IDs in the output are clean semantic identifiers (n1, n2, ...) assigned
+by reading-order position (top-to-bottom, left-to-right). SoM mark IDs are
+internal only — they never appear in the final IR.
 """
 from __future__ import annotations
+import copy
 import datetime
 import logging
 from typing import Any
 
-from pipeline.models import ElementRegistry, VLMOperation
+from pipeline.models import BoardSnapshot, ElementRegistry
 
 log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Shape mapping: CV shape_type -> static-schema.json enum
-# ---------------------------------------------------------------------------
+# Canonical shape map — values must match the static-schema.json shape enum exactly.
 _SHAPE_MAP: dict[str, str] = {
     "rectangle": "rectangle",
     "diamond": "diamond",
     "oval": "oval",
+    "parallelogram": "parallelogram",
     "circle": "circle",
+    "rounded-rectangle": "rounded-rectangle",
     "triangle": "triangle",
     "other": "other",
-    "connection": "other",   # shouldn't appear as node, but guard it
 }
 
-# ---------------------------------------------------------------------------
-# Tool-used normalisation for operation-schema enum
-# ---------------------------------------------------------------------------
-_TOOL_MAP: dict[str, str] = {
-    "marker": "marker",
-    "pen": "marker",
-    "black marker": "marker",
-    "digital pen": "digital pen",
-    "eraser": "eraser",
-    "pointer": "pointer",
-    "slide": "slide transition",
-    "slide transition": "slide transition",
-}
-
+# CV shape types that indicate a connection/edge, not a node.
 _CONNECTION_SHAPES = {"arrow", "line", "connection"}
 
-
-def _normalise_tool(raw: str | None) -> str:
-    if not raw:
-        return "other"
-    lower = raw.lower()
-    for key, val in _TOOL_MAP.items():
-        if key in lower:
-            return val
-    return "other"
+# Annotation types recognised by the schema.
+_ANNOTATION_TYPES = {
+    "container", "separator", "highlight", "circle",
+    "underline", "arrow", "cloud", "strikethrough",
+}
 
 
-# ---------------------------------------------------------------------------
-# Mark info aggregation
-# ---------------------------------------------------------------------------
+def _assign_node_ids(
+    registry: ElementRegistry,
+    mark_descriptions: dict[int, dict[str, Any]],
+) -> dict[int, str]:
+    """Return a mapping mark_id → nX using top-to-bottom, left-to-right order.
 
-def _build_mark_info(
-    operations: list[VLMOperation],
-) -> dict[int, dict[str, Any]]:
-    """Return the latest VLM description for each mark ID.
-
-    Scans operations in order so later operations overwrite earlier ones
-    for the same mark — giving us the most up-to-date description.
+    Nodes are sorted by centroid (y bucketed into rows of 50 px, then x)
+    to follow the left-to-right, level-by-level convention.
+    Marks that CV or VLM classifies as connections or annotations are excluded.
     """
-    info: dict[int, dict[str, Any]] = {}
-    for op in operations:
-        for mark_id, desc in op.per_mark_descriptions.items():
-            info[mark_id] = desc
-    return info
+    node_regions = []
+    for mark_id, region in registry.elements.items():
+        if region.shape_type in _CONNECTION_SHAPES:
+            continue
+        vlm_type = mark_descriptions.get(mark_id, {}).get("element_type", "node")
+        if vlm_type in {"connection", "annotation"}:
+            continue
+        node_regions.append(region)
 
+    node_regions.sort(key=lambda r: (r.centroid[1] // 50, r.centroid[0]))
+    return {r.mark_id: f"n{i + 1}" for i, r in enumerate(node_regions)}
 
-def _collect_connections(operations: list[VLMOperation]) -> list[dict]:
-    """Collect all VLM-described connections, deduplicating by (from, to, direction)."""
-    seen: set[tuple] = set()
-    result: list[dict] = []
-    for op in operations:
-        for conn in op.connections:
-            key = (conn.get("from_mark"), conn.get("to_mark"), conn.get("direction"))
-            if key not in seen:
-                seen.add(key)
-                result.append(conn)
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Main builder
-# ---------------------------------------------------------------------------
 
 def build(
     registry: ElementRegistry,
-    operations: list[VLMOperation],
-    snapshot_timestamp: float,
-    video_name: str,
+    snapshot: BoardSnapshot,
     time_taken: str = "00:00",
 ) -> dict:
-    """Build a static-schema.json-conformant dict from CV + VLM data.
+    """Build a static-schema.json-conformant dict from CV geometry + VLM snapshot.
 
     Args:
-        registry:           Active ElementRegistry at pen-lift.
-        operations:         All VLMOperations up to and including the current one.
-        snapshot_timestamp: Board timestamp (seconds) for this snapshot.
-        video_name:         Source video filename (for provenance).
-        time_taken:         Wall-clock analysis duration in MM:SS.
+        registry:   ElementRegistry at the pen-lift moment (CV ground truth).
+        snapshot:   BoardSnapshot from stage2.analyse_snapshots() for this keyframe.
+        time_taken: Wall-clock analysis duration in MM:SS.
 
     Returns:
         dict conforming to static-schema.json.
+        Node IDs are n1, n2, ... — no SoM mark IDs appear in the output.
     """
-    mark_info = _build_mark_info(operations)
-    vlm_connections = _collect_connections(operations)
+    mark_descriptions = snapshot.mark_descriptions
+    mark_to_nid = _assign_node_ids(registry, mark_descriptions)
+    valid_mark_ids = set(mark_to_nid.keys())
 
-    # Confidence: lowest confidence among contributing operations, or "high" if none
-    if operations:
-        confidence_rank = {"high": 0, "medium": 1, "low": 2}
-        worst = max(operations, key=lambda o: confidence_rank.get(o.confidence, 1))
-        overall_confidence = worst.confidence
-    else:
-        overall_confidence = "high"
+    
+    for mid in mark_descriptions:
+        if mid not in registry.elements:
+            log.warning(
+                "VLM described mark [%d] not present in CV registry — skipping (possible hallucination)",
+                mid,
+            )
 
-    # --- elements.nodes ---
+   
     nodes: list[dict] = []
-    for mark_id, region in sorted(registry.elements.items()):
-        if region.shape_type in _CONNECTION_SHAPES:
-            continue  # handled as connections below
-
-        info = mark_info.get(mark_id, {})
-        element_type = info.get("element_type", "node")
-        if element_type == "connection":
-            continue  # VLM says this is a connection; skip from nodes
-
+    for mark_id in sorted(mark_to_nid.keys()):
+        region = registry.elements[mark_id]
+        desc = mark_descriptions.get(mark_id, {})
         x, y, w, h = region.bbox
-        shape = _SHAPE_MAP.get(region.shape_type, "other")
+
+        # Shape: prefer VLM (semantic context) over CV (geometric heuristic)
+        cv_shape = _SHAPE_MAP.get(region.shape_type, "other")
+        vlm_shape_raw = desc.get("shape")
+        vlm_shape = _SHAPE_MAP.get(vlm_shape_raw, "other") if vlm_shape_raw else None
+
+        if vlm_shape and vlm_shape != cv_shape:
+            log.debug(
+                "Shape mismatch mark [%d]: CV=%s VLM=%s — using VLM",
+                mark_id, cv_shape, vlm_shape,
+            )
+        shape = vlm_shape if vlm_shape else cv_shape
 
         node: dict = {
-            "id": f"mark-{mark_id}",
+            "id": mark_to_nid[mark_id],
             "shape": shape,
-            "text": info.get("text"),
+            "text": desc.get("text"),
+            # Position from CV registry — always ground truth
             "position": {"x": float(x + w // 2), "y": float(y + h // 2)},
         }
+
+        # Only include visual if VLM found a meaningful color
+        color = (desc.get("visual") or {}).get("color")
+        if color:
+            node["visual"] = {"color": color}
+
         nodes.append(node)
 
-    # --- elements.connections ---
+    
     connections: list[dict] = []
-    conn_idx = 0
-    for conn in vlm_connections:
+    conn_idx = 1
+    for conn in snapshot.connections:
         from_id = conn.get("from_mark")
         to_id = conn.get("to_mark")
-        if from_id is None or to_id is None:
+
+        if from_id not in valid_mark_ids or to_id not in valid_mark_ids:
+            log.debug(
+                "Skipping dangling connection [%s]->[%s]: mark not in node registry",
+                from_id, to_id,
+            )
             continue
 
         direction = conn.get("direction", "forward")
         if direction not in {"forward", "backward", "bidirectional", "none"}:
             direction = "forward"
 
-        line_type_raw = conn.get("line_type", "solid")
-        line_type = "solid" if "solid" in line_type_raw else (
-            "dashed" if "dash" in line_type_raw else (
-                "dotted" if "dot" in line_type_raw else "solid"
-            )
-        )
+        line_type = conn.get("line_type", "solid")
+        if line_type not in {"solid", "dashed", "dotted"}:
+            line_type = "solid"
 
         entry: dict = {
-            "id": f"conn-{conn_idx}",
-            "source": f"mark-{from_id}",
-            "target": f"mark-{to_id}",
+            "id": f"c{conn_idx}",
+            "source": mark_to_nid[from_id],
+            "target": mark_to_nid[to_id],
             "direction": direction,
             "line_type": line_type,
         }
-        if conn.get("label"):
-            entry["label"] = conn["label"]
+        label = conn.get("label")
+        if label:
+            entry["label"] = label
         connections.append(entry)
         conn_idx += 1
 
-    # --- semantics.symbols ---
-    shape_meanings: dict[str, str] = {
-        "rectangle": "process / action step",
-        "diamond": "decision point",
-        "oval": "start or end terminal",
-        "circle": "connector / junction",
-        "triangle": "off-page connector",
-        "other": "custom element",
+    
+    
+    hierarchy: list[dict] = []
+    for i, group in enumerate(snapshot.groupings):
+        label = group.get("label") or f"group-{i + 1}"
+        members = [
+            mark_to_nid[m]
+            for m in group.get("members", [])
+            if m in mark_to_nid
+        ]
+        if not members:
+            continue
+        hierarchy.append({
+            "id": label,
+            "label": label,
+            "parent": group.get("parent"),
+            "children": members,
+        })
+
+    
+    present_shapes = {
+        (mark_descriptions.get(mid, {}).get("shape") or
+         _SHAPE_MAP.get(registry.elements[mid].shape_type, "other"))
+        for mid in valid_mark_ids
     }
-    used_shapes = {_SHAPE_MAP.get(r.shape_type, "other") for r in registry.elements.values()}
-    symbols = [
-        {
+    symbols: list[dict] = []
+    for sm in snapshot.symbol_meanings:
+        shape = sm.get("shape")
+        meaning = sm.get("meaning")
+        if not shape or not meaning:
+            continue
+        if shape not in present_shapes:
+            continue
+        applicable = [
+            mark_to_nid[mid] for mid in valid_mark_ids
+            if (mark_descriptions.get(mid, {}).get("shape") or
+                _SHAPE_MAP.get(registry.elements[mid].shape_type, "other")) == shape
+        ]
+        symbols.append({
             "symbol": shape,
             "meaning": meaning,
-            "applicable_to": [
-                f"mark-{mid}" for mid, reg in registry.elements.items()
-                if _SHAPE_MAP.get(reg.shape_type, "other") == shape
-            ],
-        }
-        for shape, meaning in shape_meanings.items()
-        if shape in used_shapes
-    ]
+            "applicable_to": applicable,
+        })
 
-    # --- semantics.annotations (from HIGHLIGHTING operations) ---
+    
     annotations: list[dict] = []
-    ann_idx = 0
-    for op in operations:
-        if op.operation_type == "HIGHLIGHTING":
-            for mark_id in op.marks_involved:
-                annotations.append({
-                    "id": f"ann-{ann_idx}",
-                    "target": f"mark-{mark_id}",
-                    "annotation_type": "highlight",
-                    "content": op.pedagogical_context or None,
-                })
-                ann_idx += 1
+    ann_idx = 1
+    for ann in snapshot.annotations:
+        mark_id = ann.get("mark_id")
+        ann_type = ann.get("annotation_type", "highlight")
+        if mark_id not in mark_to_nid:
+            log.debug("Skipping annotation on unknown mark [%s]", mark_id)
+            continue
+        if ann_type not in _ANNOTATION_TYPES:
+            ann_type = "highlight"
+        annotations.append({
+            "id": f"ann-{ann_idx}",
+            "target": mark_to_nid[mark_id],
+            "annotation_type": ann_type,
+            "content": ann.get("content"),
+        })
+        ann_idx += 1
 
-    # --- state.board_state ---
-    if operations:
-        last_op = operations[-1]
-        board_state = last_op.pedagogical_context or (
-            f"Board at {snapshot_timestamp:.1f}s: "
-            f"{len(registry.elements)} elements visible."
-        )
-    else:
-        board_state = f"Board at {snapshot_timestamp:.1f}s: {len(registry.elements)} elements visible."
+    
+    cross_links: list[dict] = []
+    for cl in snapshot.cross_links:
+        if all(cl.get(k) for k in ("source_flowchart", "target_flowchart",
+                                    "source_element", "target_element")):
+            cross_links.append(copy.copy(cl))
+
+    
+    structure: dict = {}
+    if hierarchy:
+        structure["hierarchy"] = hierarchy
+
+    state: dict = {
+        "board_state": snapshot.board_state or (
+            f"Board at {snapshot.timestamp:.1f}s: {len(nodes)} elements visible."
+        ),
+    }
+    if cross_links:
+        state["cross_links"] = cross_links
+
+    semantics: dict = {}
+    if symbols:
+        semantics["symbols"] = symbols
+    if annotations:
+        semantics["annotations"] = annotations
 
     return {
-        "id": datetime.datetime.utcfromtimestamp(snapshot_timestamp).isoformat() + "Z",
+        "id": datetime.datetime.utcnow().isoformat() + "Z",
         "elements": {
             "nodes": nodes,
             "connections": connections,
         },
-        "structure": {
-            "hierarchy": [],
-        },
-        "state": {
-            "board_state": board_state,
-        },
-        "semantics": {
-            "symbols": symbols if symbols else None,
-            "annotations": annotations if annotations else None,
-        },
+        "structure": structure,
+        "state": state,
+        "semantics": semantics,
         "provenance": {
             "model": "gemini-2.5-flash + opencv-cv",
-            "confidence": overall_confidence,
-            "visibility_issues": None,
+            "confidence": snapshot.confidence,
+            "visibility_issues": snapshot.visibility_issues,
             "time_taken": time_taken,
         },
     }

@@ -122,6 +122,27 @@ class KeyframeAnnotation:
 
 
 @dataclass
+class BoardSnapshot:
+    """VLM analysis of a single keyframe for static IR generation.
+
+    Produced by stage2.analyse_snapshots() for each pen-lift keyframe.
+    Contains all fields needed to populate static-schema.json directly.
+    CV registry provides ground-truth geometry; this provides semantics.
+    """
+    segment_id: int
+    timestamp: float                    # pen-lift timestamp (seconds)
+    mark_descriptions: dict[int, dict]  # mark_id → {text, shape, element_type, semantic_role, visual}
+    connections: list[dict]             # {from_mark, to_mark, direction, line_type, label}
+    symbol_meanings: list[dict]         # [{shape, meaning}] — VLM-verified legend
+    groupings: list[dict]               # [{label, parent, members: [mark_id]}]
+    annotations: list[dict]             # [{mark_id, annotation_type, content}]
+    cross_links: list[dict]             # [{source_flowchart, target_flowchart, source_element, target_element, label}]
+    board_state: str
+    confidence: str                     # high | medium | low
+    visibility_issues: str | None
+
+
+@dataclass
 class GroundedElement:
     """A DetectedRegion enriched by VLM semantic analysis."""
     mark_id: int

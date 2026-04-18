@@ -23,17 +23,15 @@ from pathlib import Path
 
 import google.generativeai as genai
 
+from PIL import Image
+
 from pipeline import config
-from pipeline.models import ElementRegistry, VLMOperation
+from pipeline.models import BoardSnapshot, ElementRegistry, KeyframeAnnotation, VLMOperation
 
 log = logging.getLogger(__name__)
 
 _CACHE_FILENAME = "vlm_cache.json"
 
-
-# ---------------------------------------------------------------------------
-# Registry serialisation for the prompt
-# ---------------------------------------------------------------------------
 
 def _registry_to_prompt_lines(registry: ElementRegistry) -> str:
     """Describe every active mark to the VLM in a compact numbered list."""
@@ -65,9 +63,6 @@ def _registry_to_prompt_lines(registry: ElementRegistry) -> str:
     return "\n".join(lines)
 
 
-# ---------------------------------------------------------------------------
-# Prompt components
-# ---------------------------------------------------------------------------
 
 _TAXONOMY = """\
 OPERATION TAXONOMY
@@ -169,7 +164,6 @@ Respond with ONLY valid JSON — no preamble, no markdown fences.
 }
 """
 
-# Few-shot example ported from llm-action-detection-api/agentic-analyser.py
 _FEW_SHOT_EXAMPLE = """\
 FEW-SHOT EXAMPLE (reference format only — do not copy timestamps or content):
 
@@ -292,10 +286,6 @@ def _build_verification_prompt(analysis_json: str) -> str:
     )
 
 
-# ---------------------------------------------------------------------------
-# Upload / poll helpers (ported from llm-action-detection-api/agentic-analyser.py)
-# ---------------------------------------------------------------------------
-
 def _upload_with_retry(video_path: Path, max_retries: int = 3):
     for attempt in range(max_retries):
         try:
@@ -325,9 +315,6 @@ def _wait_for_processing(video_file, timeout: float = 300.0):
     return video_file
 
 
-# ---------------------------------------------------------------------------
-# JSON extraction
-# ---------------------------------------------------------------------------
 
 def _extract_json(text: str) -> dict:
     """Extract JSON from VLM response — handles fenced and bare objects."""
@@ -344,9 +331,6 @@ def _extract_json(text: str) -> dict:
     raise ValueError("No JSON found in VLM response")
 
 
-# ---------------------------------------------------------------------------
-# Response parsing
-# ---------------------------------------------------------------------------
 
 def _parse_operations(raw: dict) -> list[VLMOperation]:
     ops: list[VLMOperation] = []
@@ -377,9 +361,6 @@ def _collect_text(response) -> str:
     return "\n".join(text_parts) or response.text
 
 
-# ---------------------------------------------------------------------------
-# Main entry point
-# ---------------------------------------------------------------------------
 
 def run(
     marked_video_path: Path,
@@ -474,3 +455,226 @@ def run(
     operations = _parse_operations(raw)
     log.info("Stage 2: parsed %d operations", len(operations))
     return operations
+
+
+_SNAPSHOT_SCHEMA = """\
+SNAPSHOT OUTPUT SCHEMA
+Respond with ONLY valid JSON — no preamble, no markdown fences.
+
+{
+  "mark_descriptions": {
+    "<mark_id>": {
+      "text": "<all text visible inside or adjacent to this mark, or null>",
+      "shape": "rectangle|diamond|oval|parallelogram|circle|rounded-rectangle|triangle|other",
+      "element_type": "node|connection|annotation",
+      "semantic_role": "<what this element represents in the diagram, e.g. 'start terminal', 'decision point', 'process step'>",
+      "visual": {"color": "<dominant non-black/white color if present, e.g. 'red', 'blue', else null>"}
+    }
+  },
+  "connections": [
+    {
+      "from_mark": <int>,
+      "to_mark": <int>,
+      "direction": "forward|backward|bidirectional|none",
+      "line_type": "solid|dashed|dotted",
+      "label": "<text on or beside the arrow/line, or null>"
+    }
+  ],
+  "symbol_meanings": [
+    {
+      "shape": "<shape name matching the enum above>",
+      "meaning": "<what this shape convention represents in this diagram>"
+    }
+  ],
+  "groupings": [
+    {
+      "label": "<descriptive group name>",
+      "parent": "<parent group label for nested groups, or null for top-level>",
+      "members": [<mark_id>, ...]
+    }
+  ],
+  "annotations": [
+    {
+      "mark_id": <int>,
+      "annotation_type": "container|separator|highlight|circle|underline|arrow|cloud|strikethrough",
+      "content": "<text attached to the annotation, or null>"
+    }
+  ],
+  "cross_links": [
+    {
+      "source_flowchart": "<label or description of the flowchart containing the source>",
+      "target_flowchart": "<label or description of the flowchart containing the target>",
+      "source_element": "<description of source element in its flowchart>",
+      "target_element": "<description of target element in its flowchart>",
+      "label": "<relationship label, or null>"
+    }
+  ],
+  "board_state": "<complete natural-language description of the full board>",
+  "confidence": "high|medium|low",
+  "visibility_issues": "<description of any glare, occlusion, or legibility problems, or null>"
+}
+"""
+
+_SNAPSHOT_RULES = """\
+ANALYSIS RULES
+
+MARK DESCRIPTIONS — required for every mark in the CV list:
+  text        : read all text inside or near the mark; null if none visible
+  shape       : use the enum — CORRECT the CV shape if you see it more clearly
+                (the CV shape shown in the marks list is a hint, not ground truth)
+  element_type: node = standalone flowchart element; connection = arrow or line;
+                annotation = emphasis mark overlaid on existing content
+  semantic_role: describe the element's function in this diagram
+  visual.color: note a distinctive non-black/white fill or stroke color; null otherwise
+
+CONNECTIONS — edges between marks:
+  Only report connections where BOTH endpoints are numbered marks in the CV list.
+  direction : forward = arrowhead points from→to; backward = arrowhead points to→from;
+              bidirectional = arrowheads at both ends; none = undirected line
+  line_type : solid = unbroken; dashed = evenly broken segments; dotted = dot pattern
+
+SYMBOL MEANINGS — shape legend:
+  Only include shapes that actually appear in this snapshot.
+  Infer meaning from diagram context (e.g. diamonds at branch points → "decision point").
+  Omit entirely if the diagram convention cannot be determined with confidence.
+
+GROUPINGS — logical hierarchy:
+  Only include if the board shows clear groupings: swim lanes, explicit group boxes,
+  sub-flow regions with labels, or numbered stages.
+  Omit if the diagram is flat with no visible grouping structure.
+
+ANNOTATIONS — emphasis overlays:
+  Only report marks drawn ON TOP OF existing content for emphasis.
+  Do NOT report regular nodes or connections as annotations.
+
+CROSS-LINKS — multiple distinct flowcharts:
+  Only include if two or more clearly distinct diagrams share the board with a
+  visible connecting relationship between them.
+  Omit for a single connected diagram.
+
+Output ONLY valid JSON. Empty lists [] for sections with no items. null for unknown values.
+"""
+
+
+def _build_snapshot_prompt(keyframe: KeyframeAnnotation, registry: ElementRegistry) -> str:
+    """Build the per-keyframe static IR prompt."""
+    lines = [
+        f"TASK: Whiteboard Snapshot Analysis for Accessible IR",
+        f"Snapshot timestamp: {keyframe.timestamp:.1f}s\n",
+        "CV-DETECTED MARKS",
+        "The following elements were detected by the computer-vision pipeline.",
+        "Their positions and bounding boxes are ground truth. Shapes are CV estimates",
+        "— correct them in mark_descriptions if you see the shape more clearly.\n",
+    ]
+    for mark in sorted(keyframe.marks, key=lambda m: m["mark_id"]):
+        mid = mark["mark_id"]
+        region = registry.elements.get(mid)
+        if region is None:
+            continue
+        x, y, w, h = region.bbox
+        cx, cy = region.centroid
+        lines.append(
+            f"  Mark [{mid}]: CV shape={region.shape_type}, "
+            f"bbox=(x={x}, y={y}, w={w}, h={h}), centroid=({cx},{cy})"
+        )
+
+    lines.append("")
+    lines.append(_SNAPSHOT_RULES)
+    lines.append(_SNAPSHOT_SCHEMA)
+    return "\n".join(lines)
+
+
+def _parse_snapshot(raw: dict) -> BoardSnapshot:
+    """Parse VLM JSON response into a BoardSnapshot."""
+    pmd_raw = raw.get("mark_descriptions", {})
+    pmd = {int(k): v for k, v in pmd_raw.items()}
+    return BoardSnapshot(
+        segment_id=raw["_segment_id"],
+        timestamp=raw["_timestamp"],
+        mark_descriptions=pmd,
+        connections=raw.get("connections", []),
+        symbol_meanings=raw.get("symbol_meanings", []),
+        groupings=raw.get("groupings", []),
+        annotations=raw.get("annotations", []),
+        cross_links=raw.get("cross_links", []),
+        board_state=raw.get("board_state", ""),
+        confidence=raw.get("confidence", "medium"),
+        visibility_issues=raw.get("visibility_issues"),
+    )
+
+
+def analyse_snapshots(
+    keyframes: list[KeyframeAnnotation],
+    snapshot_registries: list[ElementRegistry],
+    output_dir: Path,
+) -> list[BoardSnapshot]:
+    """Run a focused VLM analysis on each pen-lift keyframe for static IR.
+
+    Each keyframe gets a dedicated call with a prompt that mirrors static-schema.json
+    exactly — the VLM is told every field it needs to fill and what each means.
+    Results are cached to output_dir/snapshot_cache.json.
+
+    Args:
+        keyframes:           KeyframeAnnotation list from stage1 (one per pen-lift).
+        snapshot_registries: Parallel list of ElementRegistry snapshots at each pen-lift.
+        output_dir:          Directory for the snapshot cache.
+
+    Returns:
+        list[BoardSnapshot], one per keyframe, in the same order.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = output_dir / "snapshot_cache.json"
+
+    if cache_path.exists():
+        log.info("Stage 2: loading cached snapshot analyses from %s", cache_path)
+        cached = json.loads(cache_path.read_text())
+        return [_parse_snapshot(item) for item in cached]
+
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY environment variable is not set")
+    genai.configure(api_key=api_key)
+
+    model = genai.GenerativeModel(model_name=config.VLM_MODEL)
+    snapshots: list[BoardSnapshot] = []
+    raw_list: list[dict] = []
+
+    for keyframe, registry in zip(keyframes, snapshot_registries):
+        log.info(
+            "Stage 2: snapshot analysis %d/%d at %.1fs...",
+            keyframe.segment_id, len(keyframes), keyframe.timestamp,
+        )
+        prompt = _build_snapshot_prompt(keyframe, registry)
+        image = Image.open(keyframe.image_path)
+
+        for attempt in range(3):
+            try:
+                response = model.generate_content(
+                    [image, prompt],
+                    request_options={"timeout": config.VLM_TIMEOUT},
+                )
+                raw = _extract_json(_collect_text(response))
+                break
+            except Exception as exc:
+                if attempt == 2:
+                    log.error(
+                        "Stage 2: snapshot %d failed after 3 attempts: %s",
+                        keyframe.segment_id, exc,
+                    )
+                    raw = {}
+                else:
+                    wait = (2 ** attempt) + random.uniform(0, 1)
+                    log.warning(
+                        "Stage 2: snapshot %d attempt %d failed: %s — retrying in %.1fs",
+                        keyframe.segment_id, attempt + 1, exc, wait,
+                    )
+                    time.sleep(wait)
+
+        raw["_segment_id"] = keyframe.segment_id
+        raw["_timestamp"] = keyframe.timestamp
+        raw_list.append(raw)
+        snapshots.append(_parse_snapshot(raw))
+
+    cache_path.write_text(json.dumps(raw_list, indent=2))
+    log.info("Stage 2: cached %d snapshot analyses -> %s", len(snapshots), cache_path)
+    return snapshots

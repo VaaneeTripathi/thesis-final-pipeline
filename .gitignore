@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 .env
 outputs/test_run/
+src/pipeline/__pycache__/*
+src/thesis_final_pipeline.egg-info/*
