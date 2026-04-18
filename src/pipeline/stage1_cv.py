@@ -1,18 +1,21 @@
-"""Stage 1: CV processing, SoM marking, and marked video generation.
+"""Stage 1: CV processing, temporal segmentation, and keyframe annotation.
 
 Single pass through the ROI-cropped video:
-  1. GMM background subtraction -> foreground ratio per frame
-  2. SSIM between sampled frames -> perceptual change magnitude
-  3. Hysteresis thresholding -> activity / idle temporal segmentation
-  4. On pen-lift: contour detection + shape classification -> ElementRegistry update
-  5. Every frame: overlay SoM marks (numbered labels + colored bboxes)
-  6. Write marked frames to marked_video.mp4
+  1. GMM background subtraction → foreground ratio per frame
+  2. SSIM between sampled frames → perceptual change magnitude
+  3. Hysteresis thresholding → activity / idle temporal segmentation
+  4. On pen-lift: contour detection + noise filtering + shape classification
+     → ElementRegistry update
+  5. On pen-lift: draw SoM marks on the stable keyframe_after, write PNG
+
+No marked video is produced. SoM marks are applied only to the still
+keyframe at each pen-lift, keeping the original video clean for the VLM.
 
 Outputs:
-  - ElementRegistry (mark_id -> DetectedRegion, final state after all pen-lifts)
-  - list[TemporalSegment] (one per activity window)
-  - list[ElementRegistry] (registry snapshot taken after each pen-lift, parallel to segments)
-  - Path to marked_video.mp4
+  - ElementRegistry         — final state after all pen-lifts
+  - list[TemporalSegment]   — one per activity window
+  - list[ElementRegistry]   — registry snapshot at each pen-lift (parallel to segments)
+  - list[KeyframeAnnotation] — one annotated PNG per pen-lift
 """
 from __future__ import annotations
 import logging
@@ -23,7 +26,12 @@ import numpy as np
 from skimage.metrics import structural_similarity as ssim
 
 from pipeline import config
-from pipeline.models import DetectedRegion, ElementRegistry, TemporalSegment
+from pipeline.models import (
+    DetectedRegion,
+    ElementRegistry,
+    KeyframeAnnotation,
+    TemporalSegment,
+)
 from pipeline.stage0_ingest import VideoIngest
 
 log = logging.getLogger(__name__)
@@ -31,18 +39,10 @@ log = logging.getLogger(__name__)
 _CONNECTION_SHAPES = {"arrow", "line", "connection"}
 
 
-# ---------------------------------------------------------------------------
-# Preprocessing
-# ---------------------------------------------------------------------------
-
 def _preprocess(frame: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Convert a BGR ROI frame to gray, binary, and edge images.
-
-    Returns (gray, binary, edges).
-    """
+    """Convert a BGR ROI frame to gray, binary, and edge images."""
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-    # CLAHE for uneven whiteboard lighting (ported from flowchart-conversion/preprocess.py)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     enhanced = clahe.apply(cv2.medianBlur(gray, 5))
 
@@ -57,12 +57,8 @@ def _preprocess(frame: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return gray, binary, edges
 
 
-# ---------------------------------------------------------------------------
-# Shape classification (ported from flowchart-conversion/node_detection.py)
-# ---------------------------------------------------------------------------
-
 def _classify_shape(contour: np.ndarray, x: int, y: int, w: int, h: int) -> str:
-    """Classify a closed contour as one of: rectangle, diamond, oval, circle, triangle, other."""
+    """Classify a closed contour as rectangle, diamond, oval, circle, triangle, or other."""
     peri = cv2.arcLength(contour, True)
     if peri == 0:
         return "other"
@@ -78,30 +74,61 @@ def _classify_shape(contour: np.ndarray, x: int, y: int, w: int, h: int) -> str:
 
     if n == 3:
         return "triangle"
-
     if n == 4:
-        # Diamond: 4 vertices but the contour only fills ~half the bounding box
-        # because the corners of the bbox are empty.
-        # Rectangle: fills most of the bbox.
         return "rectangle" if extent >= 0.65 else "diamond"
-
     if circularity >= 0.6 or n >= 7:
         if extent > 0.5:
             return "circle" if 0.85 <= aspect <= 1.15 else "oval"
-
     return "other"
 
 
-# ---------------------------------------------------------------------------
-# Element detection on a stable frame
-# ---------------------------------------------------------------------------
+def _passes_noise_filters(
+    contour: np.ndarray,
+    x: int, y: int, w: int, h: int,
+    frame_shape: tuple[int, int],
+) -> bool:
+    """Return True if the detection passes solidity and edge-margin filters.
+
+    Edge margin: skip contours whose bounding box touches within EDGE_MARGIN
+    pixels of the frame boundary — these are typically partial shapes at the
+    ROI edge, not real whiteboard elements.
+
+    Solidity: contour_area / convex_hull_area — blobs far below 1.0 are noisy
+    irregular fragments, not clean shapes.
+    """
+    frame_h, frame_w = frame_shape
+    margin = config.EDGE_MARGIN
+
+    if (x < margin or y < margin or
+            x + w > frame_w - margin or y + h > frame_h - margin):
+        return False
+
+    hull = cv2.convexHull(contour)
+    hull_area = cv2.contourArea(hull)
+    if hull_area > 0:
+        solidity = cv2.contourArea(contour) / hull_area
+        if solidity < config.MIN_SOLIDITY:
+            return False
+
+    return True
+
+
+def _apply_marks_cap(detections: list[dict]) -> list[dict]:
+    """Keep only the top MAX_MARKS detections ranked by contour area."""
+    if len(detections) <= config.MAX_MARKS:
+        return detections
+    ranked = sorted(detections, key=lambda d: cv2.contourArea(d["contour"]), reverse=True)
+    log.debug("Marks cap applied: %d → %d detections", len(detections), config.MAX_MARKS)
+    return ranked[: config.MAX_MARKS]
+
 
 def _detect_nodes(binary: np.ndarray, gray: np.ndarray) -> list[dict]:
-    """Detect closed-shape nodes (rect, diamond, oval, circle, triangle) via contours."""
+    """Detect closed-shape nodes via contours, with noise filters applied."""
     kernel = np.ones((3, 3), np.uint8)
     dilated = cv2.dilate(binary, kernel, iterations=1)
 
     contours, _ = cv2.findContours(dilated, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    frame_shape = binary.shape[:2]
     detections: list[dict] = []
 
     for contour in contours:
@@ -116,6 +143,9 @@ def _detect_nodes(binary: np.ndarray, gray: np.ndarray) -> list[dict]:
 
         extent = area / bbox_area if bbox_area > 0 else 0
         if extent < 0.08:
+            continue
+
+        if not _passes_noise_filters(contour, x, y, w, h, frame_shape):
             continue
 
         shape_type = _classify_shape(contour, x, y, w, h)
@@ -143,8 +173,8 @@ def _detect_connections(
 ) -> list[dict]:
     """Detect line/arrow connections via HoughLinesP.
 
-    Lines whose both endpoints are near a node bbox are classified as
-    'connection'. All others are discarded (likely noise or internal marks).
+    Lines whose both endpoints fall within the same node bbox are discarded
+    (internal marks). All others connecting distinct regions are kept.
     """
     lines = cv2.HoughLinesP(
         edges,
@@ -158,13 +188,13 @@ def _detect_connections(
     if lines is None:
         return []
 
+    frame_shape = edges.shape[:2]
     detections: list[dict] = []
+
     for line in lines:
         x1, y1, x2, y2 = line[0]
 
-        # Skip lines internal to a single node bbox
         if _point_in_any_bbox(x1, y1, node_bboxes) and _point_in_any_bbox(x2, y2, node_bboxes):
-            # Both endpoints in the same bbox? Check if the same one
             b1 = _bbox_containing(x1, y1, node_bboxes)
             b2 = _bbox_containing(x2, y2, node_bboxes)
             if b1 == b2:
@@ -175,8 +205,11 @@ def _detect_connections(
         by = min(y1, y2)
         bw = abs(x2 - x1) + 1
         bh = abs(y2 - y1) + 1
-
         contour = np.array([[[x1, y1]], [[x2, y2]]], dtype=np.int32)
+
+        # Apply edge margin to connection midpoint
+        if not _passes_noise_filters(contour, bx, by, bw, bh, frame_shape):
+            continue
 
         detections.append({
             "bbox": (bx, by, bw, bh),
@@ -207,28 +240,13 @@ def _bbox_containing(
     return None
 
 
-# ---------------------------------------------------------------------------
-# SoM overlay
-# ---------------------------------------------------------------------------
+def _draw_som_marks(frame: np.ndarray, registry: ElementRegistry) -> np.ndarray:
+    """Overlay numbered SoM labels and bounding boxes on a still frame.
 
-def _draw_som_marks(
-    frame: np.ndarray,
-    registry: ElementRegistry,
-    is_active: bool,
-) -> np.ndarray:
-    """Overlay numbered SoM labels and bounding boxes on a frame.
-
-    Nodes get green boxes. Connections get blue lines/boxes.
-    Active periods get a subtle yellow tint to signal activity to the VLM.
+    Nodes get green boxes. Connections get red boxes. Used only for
+    keyframe PNGs — not applied to video frames.
     """
     out = frame.copy()
-
-    if is_active:
-        # Subtle yellow tint: blend with yellow
-        tint = np.zeros_like(out)
-        tint[:] = config.MARK_DELTA_HIGHLIGHT
-        out = cv2.addWeighted(out, 0.85, tint, 0.15, 0)
-
     for mark_id, region in registry.elements.items():
         x, y, w, h = region.bbox
         is_conn = region.shape_type in _CONNECTION_SHAPES
@@ -244,30 +262,57 @@ def _draw_som_marks(
 
         lx = max(x, 0)
         ly = max(y - 5, th + baseline)
-
-        # Dark background for readability
         cv2.rectangle(out, (lx, ly - th - baseline), (lx + tw + 2, ly + baseline), (0, 0, 0), -1)
         cv2.putText(out, label, (lx + 1, ly), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
 
     return out
 
 
-# ---------------------------------------------------------------------------
-# Segment type classification
-# ---------------------------------------------------------------------------
+def _write_keyframe(
+    keyframe_after: np.ndarray,
+    registry: ElementRegistry,
+    segment_id: int,
+    timestamp: float,
+    output_dir: Path,
+) -> KeyframeAnnotation:
+    """Draw SoM marks on keyframe_after and write to output_dir/keyframes/.
 
-def _classify_segment_type(
-    before: np.ndarray, after: np.ndarray
-) -> str:
+    Returns a KeyframeAnnotation with the PNG path and mark metadata.
+    The annotated image is sent to the VLM alongside the clean original video.
+    """
+    keyframes_dir = output_dir / "keyframes"
+    keyframes_dir.mkdir(parents=True, exist_ok=True)
+
+    annotated = _draw_som_marks(keyframe_after, registry)
+    image_path = keyframes_dir / f"keyframe_{segment_id:04d}.png"
+    cv2.imwrite(str(image_path), annotated)
+
+    marks = [
+        {
+            "mark_id": region.mark_id,
+            "shape_type": region.shape_type,
+            "centroid": region.centroid,
+            "bbox": region.bbox,
+        }
+        for region in registry.elements.values()
+    ]
+
+    return KeyframeAnnotation(
+        segment_id=segment_id,
+        timestamp=timestamp,
+        image_path=image_path,
+        marks=marks,
+    )
+
+
+def _classify_segment_type(before: np.ndarray, after: np.ndarray) -> str:
     """Classify an activity segment as 'activity' or 'erasure'.
 
     Erasure = ink density dropped significantly from before to after.
-    Ink density = fraction of dark pixels (ink on whiteboard).
     """
     gray_before = cv2.cvtColor(before, cv2.COLOR_BGR2GRAY)
     gray_after = cv2.cvtColor(after, cv2.COLOR_BGR2GRAY)
 
-    # Dark pixels = ink
     density_before = np.mean(gray_before < 128)
     density_after = np.mean(gray_after < 128)
 
@@ -276,15 +321,11 @@ def _classify_segment_type(
     return "activity"
 
 
-# ---------------------------------------------------------------------------
-# Main entry point
-# ---------------------------------------------------------------------------
-
 def _snapshot_registry(registry: ElementRegistry) -> ElementRegistry:
-    """Lightweight snapshot of the registry at a pen-lift moment.
+    """Frozen copy of the registry at a pen-lift moment.
 
-    Creates new DetectedRegion objects (so centroid/bbox/shape are frozen)
-    but shares the numpy contour arrays (read-only after creation).
+    Creates new DetectedRegion objects so centroid/bbox/shape are immutable.
+    Numpy contour arrays are shared (read-only after creation).
     """
     snap = ElementRegistry(next_id=registry.next_id)
     for mark_id, region in registry.elements.items():
@@ -303,20 +344,23 @@ def run(
     cap: cv2.VideoCapture,
     ingest_data: VideoIngest,
     output_dir: Path,
-) -> tuple[ElementRegistry, list[TemporalSegment], list[ElementRegistry], Path]:
-    """Process the full video: temporal segmentation + SoM marking.
+) -> tuple[ElementRegistry, list[TemporalSegment], list[ElementRegistry], list[KeyframeAnnotation]]:
+    """Process the full video: temporal segmentation + pen-lift keyframe annotation.
+
+    Args:
+        cap:          OpenCV VideoCapture positioned at frame 0.
+        ingest_data:  VideoIngest metadata (fps, roi, frame_count).
+        output_dir:   Root output directory; keyframes/ sub-dir is created here.
 
     Returns:
-        registry         — final ElementRegistry (mark_id -> DetectedRegion)
-        segments         — list[TemporalSegment] ordered by timestamp
-        marked_video_path — path to the output marked_video.mp4
+        registry            — final ElementRegistry after all pen-lifts
+        segments            — list[TemporalSegment] ordered by timestamp
+        registry_snapshots  — list[ElementRegistry] at each pen-lift (parallel to segments)
+        keyframe_annotations — list[KeyframeAnnotation] at each pen-lift (parallel to segments)
     """
     output_dir.mkdir(parents=True, exist_ok=True)
-    marked_video_path = output_dir / "marked_video.mp4"
 
     rx, ry, rw, rh = ingest_data.roi
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(marked_video_path), fourcc, ingest_data.fps, (rw, rh))
 
     gmm = cv2.createBackgroundSubtractorMOG2(
         history=config.GMM_HISTORY,
@@ -327,15 +371,14 @@ def run(
     registry = ElementRegistry()
     segments: list[TemporalSegment] = []
     registry_snapshots: list[ElementRegistry] = []
+    keyframe_annotations: list[KeyframeAnnotation] = []
 
-    # Temporal state machine
     is_active = False
     idle_count = 0
     keyframe_before: np.ndarray | None = None
     segment_start_ts = 0.0
     segment_id = 0
 
-    # SSIM tracking
     prev_gray: np.ndarray | None = None
     delta_magnitude = 0.0
 
@@ -353,11 +396,11 @@ def run(
         roi_frame = frame[ry : ry + rh, rx : rx + rw]
         timestamp = frame_idx / ingest_data.fps
 
-        # --- GMM foreground mask ---
+        # GMM foreground mask 
         fg_mask = gmm.apply(roi_frame)
         fg_ratio = float(np.count_nonzero(fg_mask)) / fg_mask.size
 
-        # --- SSIM (every N frames) ---
+        # SSIM (sampled every N frames) 
         if frame_idx % config.SSIM_SAMPLE_INTERVAL == 0:
             gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
             if prev_gray is not None:
@@ -365,7 +408,7 @@ def run(
                 delta_magnitude = float(1.0 - score)
             prev_gray = gray
 
-        # --- Hysteresis temporal state machine ---
+        # Hysteresis temporal state machine 
         if not is_active:
             if fg_ratio > config.ACTIVITY_THRESHOLD_HIGH:
                 is_active = True
@@ -377,19 +420,21 @@ def run(
             if fg_ratio < config.ACTIVITY_THRESHOLD_LOW:
                 idle_count += 1
                 if idle_count >= config.STABILITY_WINDOW:
-                    # Pen lift: transition back to idle
                     is_active = False
                     idle_count = 0
                     keyframe_after = roi_frame.copy()
 
-                    # Update registry on the stable post-activity frame
+                    # Detect elements on the stable post-activity frame
                     _, binary, edges = _preprocess(roi_frame)
                     gray_stable = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
                     nodes = _detect_nodes(binary, gray_stable)
                     node_bboxes = [d["bbox"] for d in nodes]
                     connections = _detect_connections(edges, node_bboxes)
+
+                    # Cap total marks before registry update
+                    all_detections = _apply_marks_cap(nodes + connections)
                     registry.update(
-                        nodes + connections,
+                        all_detections,
                         timestamp,
                         match_threshold=config.CENTROID_MATCH_THRESHOLD,
                     )
@@ -407,30 +452,28 @@ def run(
                     )
                     segments.append(seg)
                     registry_snapshots.append(_snapshot_registry(registry))
+
+                    # Write annotated keyframe PNG for VLM snapshot analysis
+                    kf = _write_keyframe(keyframe_after, registry, segment_id, timestamp, output_dir)
+                    keyframe_annotations.append(kf)
+
                     segment_id += 1
+                    prev_gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
 
                     log.debug(
                         "Pen-lift at %.2fs: segment %d type=%s marks=%d",
                         timestamp, segment_id - 1, seg_type, len(registry.elements),
                     )
-
-                    # Update prev_gray for SSIM continuity
-                    prev_gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
             else:
                 idle_count = 0
-
-        # --- SoM overlay ---
-        marked = _draw_som_marks(roi_frame, registry, is_active)
-        writer.write(marked)
 
         if frame_idx % 300 == 0:
             log.info("  frame %d / %d  (%.1f%%)", frame_idx, total, 100 * frame_idx / max(total, 1))
 
         frame_idx += 1
 
-    writer.release()
     log.info(
-        "Stage 1 done: %d segments, %d active marks, marked video -> %s",
-        len(segments), len(registry.elements), marked_video_path,
+        "Stage 1 done: %d segments, %d active marks, %d keyframes written",
+        len(segments), len(registry.elements), len(keyframe_annotations),
     )
-    return registry, segments, registry_snapshots, marked_video_path
+    return registry, segments, registry_snapshots, keyframe_annotations
