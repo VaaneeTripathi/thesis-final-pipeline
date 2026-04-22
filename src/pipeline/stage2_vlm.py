@@ -13,6 +13,7 @@ Response is cached to output_dir/vlm_cache.json to avoid re-running
 the API call during development.
 """
 from __future__ import annotations
+import io
 import json
 import logging
 import os
@@ -21,10 +22,9 @@ import re
 import time
 from pathlib import Path
 
-import google.generativeai as genai
-from google.api_core import exceptions as api_exceptions
-from google.api_core import retry as api_retry
-
+from google import genai
+from google.genai import errors as genai_errors
+from google.genai import types
 from PIL import Image
 
 from pipeline import config
@@ -326,10 +326,38 @@ def _build_verification_prompt(
     )
 
 
-def _upload_with_retry(video_path: Path, max_retries: int = 3):
+def _get_client() -> genai.Client:
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY environment variable is not set")
+    return genai.Client(api_key=api_key)
+
+
+def _no_thinking() -> types.GenerateContentConfig:
+    """Disable extended thinking on gemini-2.5-flash.
+
+    Without thinking_budget=0, the model can spend 20+ minutes on internal
+    chain-of-thought before emitting any tokens, causing gRPC deadline errors.
+    """
+    return types.GenerateContentConfig(
+        thinking_config=types.ThinkingConfig(thinking_budget=0)
+    )
+
+
+def _video_part(video_file) -> types.Part:
+    return types.Part.from_uri(file_uri=video_file.uri, mime_type="video/mp4")
+
+
+def _image_part(image: Image.Image) -> types.Part:
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    return types.Part.from_bytes(data=buf.getvalue(), mime_type="image/png")
+
+
+def _upload_with_retry(client: genai.Client, video_path: Path, max_retries: int = 3):
     for attempt in range(max_retries):
         try:
-            video_file = genai.upload_file(path=str(video_path))
+            video_file = client.files.upload(file=video_path)
             log.info("Uploaded %s as %s", video_path.name, video_file.name)
             return video_file
         except Exception as exc:
@@ -343,13 +371,13 @@ def _upload_with_retry(video_path: Path, max_retries: int = 3):
             time.sleep(wait)
 
 
-def _wait_for_processing(video_file, timeout: float = 300.0):
+def _wait_for_processing(client: genai.Client, video_file, timeout: float = 300.0):
     start = time.time()
     while video_file.state.name == "PROCESSING":
         if time.time() - start > timeout:
             raise TimeoutError(f"Video processing timed out after {timeout}s")
         time.sleep(5)
-        video_file = genai.get_file(video_file.name)
+        video_file = client.files.get(name=video_file.name)
     if video_file.state.name == "FAILED":
         raise RuntimeError("Gemini video processing FAILED")
     return video_file
@@ -357,27 +385,89 @@ def _wait_for_processing(video_file, timeout: float = 300.0):
 
 
 def _extract_json(text: str) -> dict:
-    """Extract JSON from VLM response — handles fenced and bare objects."""
-    # Try ```json ... ``` block first (in case model disobeys "no fences" instruction)
+    """Extract the best valid JSON object from a VLM response.
+
+    Strategy (in order):
+      1. All ```json ... ``` fenced blocks — try each from last to first so we
+         pick the most complete one; a truncated last block falls back to earlier ones.
+      2. Largest bare {...} object in the response.
+    Logs a debug excerpt around the failure position to aid diagnosis.
+    """
+    errors: list[str] = []
+
+    # Fenced blocks — try last → first (last is usually most complete, but may be truncated)
     blocks = re.findall(r"```json\s*(.*?)\s*```", text, re.DOTALL)
-    if blocks:
-        return json.loads(blocks[-1])
+    for block in reversed(blocks):
+        try:
+            return json.loads(block)
+        except json.JSONDecodeError as exc:
+            pos = exc.pos
+            snippet = block[max(0, pos - 80): pos + 80].replace("\n", "↵")
+            errors.append(f"fenced block: {exc.msg} at char {pos} — …{snippet}…")
 
-    # Try bare JSON object
-    match = re.search(r"\{[\s\S]*\}", text)
-    if match:
-        return json.loads(match.group(0))
+    # Bare JSON object — find the longest {...} span
+    for match in sorted(re.finditer(r"\{[\s\S]*\}", text), key=lambda m: len(m.group()), reverse=True):
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError as exc:
+            pos = exc.pos
+            s = match.group(0)
+            snippet = s[max(0, pos - 80): pos + 80].replace("\n", "↵")
+            errors.append(f"bare object: {exc.msg} at char {pos} — …{snippet}…")
+            break  # only try the largest match
 
-    raise ValueError("No JSON found in VLM response")
+    for err in errors:
+        log.debug("_extract_json attempt failed: %s", err)
+    log.warning(
+        "_extract_json: could not parse JSON from response (%d chars). "
+        "First 300: %s",
+        len(text), text[:300].replace("\n", " "),
+    )
+    raise ValueError(f"No valid JSON found in VLM response. Attempts: {errors}")
 
+
+
+def _coerce_mark_id(m) -> int | None:
+    if isinstance(m, (int, float)):
+        return int(m)
+    if isinstance(m, str):
+        try:
+            return int(m)
+        except ValueError:
+            return None
+    if isinstance(m, dict):
+        for key in ("mark_id", "id", "mark", "number"):
+            if key in m:
+                try:
+                    return int(m[key])
+                except (ValueError, TypeError):
+                    pass
+        # Last resort: first integer value in the dict
+        for v in m.values():
+            try:
+                return int(v)
+            except (ValueError, TypeError):
+                pass
+    return None
 
 
 def _parse_operations(raw: dict) -> list[VLMOperation]:
     ops: list[VLMOperation] = []
     for item in raw.get("operations", []):
-        # per_mark_descriptions keys are strings in JSON; convert to int
+        # per_mark_descriptions keys are strings in JSON; convert to int.
+        # Guard against non-integer keys (e.g. "mark_1") the model sometimes returns.
         pmd_raw = item.get("per_mark_descriptions", {})
-        pmd = {int(k): v for k, v in pmd_raw.items()}
+        pmd: dict = {}
+        for k, v in pmd_raw.items():
+            try:
+                pmd[int(k)] = v
+            except (ValueError, TypeError):
+                log.debug("_parse_operations: non-integer per_mark_descriptions key %r — skipped", k)
+
+        marks_involved = [
+            mid for m in item.get("marks_involved", [])
+            if (mid := _coerce_mark_id(m)) is not None
+        ]
 
         ops.append(VLMOperation(
             operation_id=item["operation_id"],
@@ -385,7 +475,7 @@ def _parse_operations(raw: dict) -> list[VLMOperation]:
             timestamp_start=item["timestamp_start"],
             timestamp_end=item["timestamp_end"],
             confidence=item.get("confidence", "medium"),
-            marks_involved=[int(m) for m in item.get("marks_involved", [])],
+            marks_involved=marks_involved,
             per_mark_descriptions=pmd,
             connections=item.get("connections", []),
             classification_reasoning=item.get("classification_reasoning", {}),
@@ -396,42 +486,47 @@ def _parse_operations(raw: dict) -> list[VLMOperation]:
     return ops
 
 
-def _collect_text(response) -> str:
-    text_parts = [p.text for p in response.parts if hasattr(p, "text") and p.text]
-    return "\n".join(text_parts) or response.text
+def _retry_delay_seconds(exc: genai_errors.ClientError) -> int:
+    """Extract the retryDelay value from a 429 ClientError response, or return 65."""
+    try:
+        details = exc.details.get("error", {}).get("details", [])
+        for d in details:
+            delay = d.get("retryDelay", "")
+            if delay:
+                return int(str(delay).rstrip("s")) + 5  # +5s buffer
+    except Exception:
+        pass
+    return 65
 
 
-def _send_with_retry(chat, content: list, timeout: int, label: str) -> object:
-    """Send a chat message with a correctly-configured retry deadline.
-
-    The gRPC retry layer has its own total-attempts deadline that defaults to
-    ~120 s and overrides the per-call timeout.  We explicitly set the retry
-    deadline to match our intended timeout so a slow video-inference call
-    doesn't get killed prematurely.
-
-    On DEADLINE_EXCEEDED we retry once more (server-side transient overload).
+def _stream_generate(client: genai.Client, contents: list, label: str) -> str:
+    """Stream tokens from the model with thinking disabled.
     """
-    _retry = api_retry.Retry(
-        initial=2.0,
-        maximum=60.0,
-        multiplier=2.0,
-        deadline=timeout,
-        predicate=api_retry.if_transient_error,
-    )
-    request_options = {"timeout": timeout, "retry": _retry}
-
-    for attempt in range(2):
+    log.info("Stage 2: %s (streaming)...", label)
+    for attempt in range(3):
         try:
-            return chat.send_message(content, request_options=request_options)
-        except api_exceptions.DeadlineExceeded as exc:
-            if attempt == 0:
+            chunks: list[str] = []
+            for chunk in client.models.generate_content_stream(
+                model=config.VLM_MODEL,
+                contents=contents,
+                config=_no_thinking(),
+            ):
+                try:
+                    if chunk.text:
+                        chunks.append(chunk.text)
+                except Exception:
+                    pass  # chunks carrying only safety ratings have no .text
+            return "".join(chunks)
+        except genai_errors.ClientError as exc:
+            if exc.code == 429 and attempt < 2:
+                wait = _retry_delay_seconds(exc)
                 log.warning(
-                    "Stage 2: %s timed out (attempt 1) — retrying once more...", label
+                    "Stage 2: %s rate-limited (429) — waiting %ds then retrying (attempt %d/3)...",
+                    label, wait, attempt + 2,
                 )
+                time.sleep(wait)
             else:
-                raise RuntimeError(
-                    f"Stage 2: {label} exceeded timeout after 2 attempts"
-                ) from exc
+                raise
 
 
 def run(
@@ -465,65 +560,39 @@ def run(
         raw = json.loads(cache_path.read_text())
         return _parse_operations(raw)
 
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        raise RuntimeError("GEMINI_API_KEY environment variable is not set")
-    genai.configure(api_key=api_key)
-
-    model = genai.GenerativeModel(model_name=config.VLM_MODEL)
+    client = _get_client()
 
     log.info("Stage 2: uploading %s to Gemini...", video_path.name)
-    video_file = _upload_with_retry(video_path)
-
-    # Upload keyframe PNGs as separate image files for spatial grounding.
-    # Images are uploaded once and reused across analysis + verification passes.
-    kf_files: list = []
-    if keyframes:
-        log.info("Stage 2: uploading %d keyframe images...", len(keyframes))
-        for kf in keyframes:
-            try:
-                kf_file = genai.upload_file(path=str(kf.image_path))
-                kf_files.append(kf_file)
-                log.debug("Uploaded keyframe %d: %s", kf.segment_id, kf_file.name)
-            except Exception as exc:
-                log.warning(
-                    "Stage 2: failed to upload keyframe %d (%s): %s — skipping",
-                    kf.segment_id, kf.image_path.name, exc,
-                )
-
-    # All uploaded resources tracked for cleanup
-    all_uploaded = [video_file] + kf_files
+    video_file = _upload_with_retry(client, video_path)
+    all_uploaded = [video_file]
 
     try:
         log.info("Stage 2: waiting for Gemini video processing...")
-        video_file = _wait_for_processing(video_file)
+        video_file = _wait_for_processing(client, video_file)
 
-        # Message content: video first, then keyframe stills, then the text prompt.
-        # The model sees them in order — video provides temporal context, keyframes
-        # provide per-moment spatial grounding.
+        # Video + text prompt only — the registry description encodes all SoM context.
+        # Keyframes are sent one-at-a-time in analyse_snapshots() (stage 2b).
         analysis_prompt = _build_analysis_prompt(registry, keyframes)
-        content = [video_file] + kf_files + [analysis_prompt]
+        content = [_video_part(video_file), analysis_prompt]
 
-        log.info("Stage 2: initial analysis (model=%s, keyframes=%d)...",
-                 config.VLM_MODEL, len(kf_files))
-        chat = model.start_chat()
-        response = _send_with_retry(chat, content, config.VLM_TIMEOUT, "initial analysis")
-        response_text = _collect_text(response)
+        response_text = _stream_generate(client, content, "initial analysis")
         raw = _extract_json(response_text)
         log.info(
             "Stage 2: initial analysis complete — %d operations",
             len(raw.get("operations", [])),
         )
 
-        # Verification pass 
+        # Cache immediately so a crash during verification doesn't lose this result.
+        # If verification succeeds the cache is overwritten with the improved version.
+        cache_path.write_text(json.dumps(raw, indent=2))
+
+        # Verification pass — prompt embeds initial JSON so no chat state needed.
         if verify:
-            log.info("Stage 2: verification pass...")
             verification_prompt = _build_verification_prompt(
                 json.dumps(raw, indent=2), keyframes
             )
-            v_content = [video_file] + kf_files + [verification_prompt]
-            v_response = _send_with_retry(chat, v_content, config.VLM_TIMEOUT, "verification pass")
-            v_text = _collect_text(v_response)
+            v_content = [_video_part(video_file), verification_prompt]
+            v_text = _stream_generate(client, v_content, "verification pass")
             try:
                 verified_raw = _extract_json(v_text)
                 raw = verified_raw
@@ -540,7 +609,7 @@ def run(
     finally:
         for uploaded in all_uploaded:
             try:
-                genai.delete_file(uploaded.name)
+                client.files.delete(name=uploaded.name)
                 log.debug("Stage 2: deleted uploaded file %s", uploaded.name)
             except Exception as exc:
                 log.warning("Stage 2: failed to delete %s: %s", uploaded.name, exc)
@@ -681,10 +750,70 @@ def _build_snapshot_prompt(keyframe: KeyframeAnnotation, registry: ElementRegist
     return "\n".join(lines)
 
 
+def _build_batch_contents(batch: list) -> list:
+    """Build the API request contents for analysing N snapshots in one call.
+
+    Interleaves per-snapshot image Parts with their CV mark context, prefixed
+    by the shared schema and output format instructions.  The model is asked to
+    return a single JSON OBJECT keyed by segment_id string — one request instead
+    of one per snapshot, dramatically reducing the daily request count.
+    """
+    n = len(batch)
+    seg_ids_str = ", ".join(str(kf.segment_id) for kf, _ in batch)
+
+    contents: list = [
+        # Schema + output format at the top so the model sees it before images
+        f"TASK: Batch Whiteboard Snapshot Analysis ({n} snapshots in one API call)\n\n"
+        f"Analyse each of the {n} whiteboard snapshots shown below.\n"
+        f"Segment IDs to analyse: [{seg_ids_str}]\n\n"
+        "OUTPUT FORMAT\n"
+        "Return a single JSON OBJECT where each top-level key is the snapshot's\n"
+        "segment_id as a STRING and each value is that snapshot's full analysis.\n"
+        f"Your response MUST contain all {n} keys: [{seg_ids_str}]\n\n"
+        "Example structure (IDs 3 and 7 shown):\n"
+        '{\n'
+        '  "3": { "mark_descriptions": {}, "connections": [], "board_state": "...", ... },\n'
+        '  "7": { "mark_descriptions": {}, "connections": [], "board_state": "...", ... }\n'
+        '}\n\n'
+        f"PER-SNAPSHOT SCHEMA AND RULES:\n{_SNAPSHOT_RULES}\n\n{_SNAPSHOT_SCHEMA}\n",
+    ]
+
+    for kf, reg in batch:
+        contents.append(
+            f"\n--- SNAPSHOT {kf.segment_id} (timestamp: {kf.timestamp:.1f}s) ---"
+        )
+        contents.append(_image_part(Image.open(kf.image_path)))
+
+        lines = [f"CV marks for snapshot {kf.segment_id}:"]
+        for mark in sorted(kf.marks, key=lambda m: m["mark_id"]):
+            mid = mark["mark_id"]
+            region = reg.elements.get(mid)
+            if region is None:
+                continue
+            x, y, w, h = region.bbox
+            cx, cy = region.centroid
+            lines.append(
+                f"  Mark [{mid}]: CV shape={region.shape_type}, "
+                f"bbox=(x={x}, y={y}, w={w}, h={h}), centroid=({cx},{cy})"
+            )
+        contents.append("\n".join(lines))
+
+    contents.append(
+        "\nReturn ONLY the JSON OBJECT with all snapshot analyses. "
+        "No preamble, no markdown fences."
+    )
+    return contents
+
+
 def _parse_snapshot(raw: dict) -> BoardSnapshot:
     """Parse VLM JSON response into a BoardSnapshot."""
     pmd_raw = raw.get("mark_descriptions", {})
-    pmd = {int(k): v for k, v in pmd_raw.items()}
+    pmd: dict = {}
+    for k, v in pmd_raw.items():
+        try:
+            pmd[int(k)] = v
+        except (ValueError, TypeError):
+            log.debug("_parse_snapshot: non-integer mark_descriptions key %r — skipped", k)
     return BoardSnapshot(
         segment_id=raw["_segment_id"],
         timestamp=raw["_timestamp"],
@@ -705,11 +834,17 @@ def analyse_snapshots(
     snapshot_registries: list[ElementRegistry],
     output_dir: Path,
 ) -> list[BoardSnapshot]:
-    """Run a focused VLM analysis on each pen-lift keyframe for static IR.
+    """Run batched VLM analysis on pen-lift keyframes for static IR.
 
-    Each keyframe gets a dedicated call with a prompt that mirrors static-schema.json
-    exactly — the VLM is told every field it needs to fill and what each means.
-    Results are cached to output_dir/snapshot_cache.json.
+    Snapshots are grouped into batches of config.SNAPSHOT_BATCH_SIZE (default 10)
+    and sent in ONE API call per batch.  For 70 keyframes this is 7 calls instead
+    of 70, keeping total usage well within the free-tier 20 req/day limit.
+
+    The cache (snapshot_cache.json) is written after EACH batch.  If a run is
+    interrupted mid-way (quota exhausted, crash, Ctrl-C), successfully analysed
+    snapshots are preserved.  Segments with no data are left out of the cache so
+    they will be retried on the next run — just re-run the pipeline; it picks up
+    where it left off.
 
     Args:
         keyframes:           KeyframeAnnotation list from stage1 (one per pen-lift).
@@ -718,60 +853,126 @@ def analyse_snapshots(
 
     Returns:
         list[BoardSnapshot], one per keyframe, in the same order.
+        Snapshots that could not be analysed are returned as empty BoardSnapshots.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     cache_path = output_dir / "snapshot_cache.json"
 
+    # Load partial cache keyed by segment_id
+    cached_by_id: dict[int, dict] = {}
     if cache_path.exists():
-        log.info("Stage 2: loading cached snapshot analyses from %s", cache_path)
-        cached = json.loads(cache_path.read_text())
-        return [_parse_snapshot(item) for item in cached]
+        try:
+            items = json.loads(cache_path.read_text())
+            cached_by_id = {item["_segment_id"]: item for item in items}
+            n_cached = sum(1 for kf in keyframes if kf.segment_id in cached_by_id)
+            if n_cached == len(keyframes):
+                log.info("Stage 2b: all %d snapshots loaded from cache", len(keyframes))
+                return [_parse_snapshot(cached_by_id[kf.segment_id]) for kf in keyframes]
+            log.info(
+                "Stage 2b: partial cache — %d/%d snapshots already done, resuming",
+                n_cached, len(keyframes),
+            )
+        except Exception as exc:
+            log.warning("Stage 2b: cache unreadable (%s) — reprocessing all", exc)
+            cached_by_id = {}
 
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        raise RuntimeError("GEMINI_API_KEY environment variable is not set")
-    genai.configure(api_key=api_key)
+    # Only process segments not yet in the cache
+    uncached = [
+        (kf, reg)
+        for kf, reg in zip(keyframes, snapshot_registries)
+        if kf.segment_id not in cached_by_id
+    ]
 
-    model = genai.GenerativeModel(model_name=config.VLM_MODEL)
-    snapshots: list[BoardSnapshot] = []
-    raw_list: list[dict] = []
+    if not uncached:
+        # Shouldn't reach here after the check above, but be safe
+        return [
+            _parse_snapshot(cached_by_id.get(
+                kf.segment_id, {"_segment_id": kf.segment_id, "_timestamp": kf.timestamp}
+            ))
+            for kf in keyframes
+        ]
 
-    for keyframe, registry in zip(keyframes, snapshot_registries):
-        log.info(
-            "Stage 2: snapshot analysis %d/%d at %.1fs...",
-            keyframe.segment_id, len(keyframes), keyframe.timestamp,
-        )
-        prompt = _build_snapshot_prompt(keyframe, registry)
-        image = Image.open(keyframe.image_path)
+    batch_size = config.SNAPSHOT_BATCH_SIZE
+    batches = [uncached[i: i + batch_size] for i in range(0, len(uncached), batch_size)]
 
-        for attempt in range(3):
-            try:
-                response = model.generate_content(
-                    [image, prompt],
-                    request_options={"timeout": config.VLM_TIMEOUT},
-                )
-                raw = _extract_json(_collect_text(response))
-                break
-            except Exception as exc:
-                if attempt == 2:
-                    log.error(
-                        "Stage 2: snapshot %d failed after 3 attempts: %s",
-                        keyframe.segment_id, exc,
-                    )
+    total_calls = 2 + len(batches)  # 2 for main video analysis + verification
+    log.info(
+        "Stage 2b: %d snapshots to analyse in %d batch(es) of up to %d "
+        "(~%d total API calls this run)",
+        len(uncached), len(batches), batch_size, total_calls,
+    )
+
+    client = _get_client()
+
+    for batch_idx, batch in enumerate(batches):
+        seg_ids = [kf.segment_id for kf, _ in batch]
+        log.info("Stage 2b: batch %d/%d — segments %s", batch_idx + 1, len(batches), seg_ids)
+
+        contents = _build_batch_contents(batch)
+
+        try:
+            text = _stream_generate(
+                client, contents,
+                f"snapshot batch {batch_idx + 1}/{len(batches)}",
+            )
+            batch_raw = _extract_json(text)
+
+            # Normalise response: model may wrap in a "snapshots" key
+            if isinstance(batch_raw, dict) and "snapshots" in batch_raw:
+                inner = batch_raw["snapshots"]
+                if isinstance(inner, dict):
+                    batch_raw = inner
+
+            # Normalise response: model may return an array instead of an object
+            if isinstance(batch_raw, list):
+                mapped: dict = {}
+                for i, item in enumerate(batch_raw):
+                    if not isinstance(item, dict):
+                        continue
+                    sid = item.get("segment_id") or item.get("_segment_id")
+                    if sid is None and i < len(batch):
+                        sid = batch[i][0].segment_id
+                    if sid is not None:
+                        mapped[str(sid)] = item
+                batch_raw = mapped
+
+            # Extract per-snapshot results; only keep entries with real analysis data
+            for kf, _ in batch:
+                raw = batch_raw.get(str(kf.segment_id), {})
+                if not isinstance(raw, dict):
                     raw = {}
+                raw["_segment_id"] = kf.segment_id
+                raw["_timestamp"] = kf.timestamp
+                if raw.get("mark_descriptions") is not None or raw.get("board_state"):
+                    cached_by_id[kf.segment_id] = raw
                 else:
-                    wait = (2 ** attempt) + random.uniform(0, 1)
                     log.warning(
-                        "Stage 2: snapshot %d attempt %d failed: %s — retrying in %.1fs",
-                        keyframe.segment_id, attempt + 1, exc, wait,
+                        "Stage 2b: segment %d absent from batch response — will retry next run",
+                        kf.segment_id,
                     )
-                    time.sleep(wait)
 
-        raw["_segment_id"] = keyframe.segment_id
-        raw["_timestamp"] = keyframe.timestamp
-        raw_list.append(raw)
-        snapshots.append(_parse_snapshot(raw))
+        except Exception as exc:
+            log.error(
+                "Stage 2b: batch %d/%d failed (%s) — segments %s will be retried next run",
+                batch_idx + 1, len(batches), exc, seg_ids,
+            )
 
-    cache_path.write_text(json.dumps(raw_list, indent=2))
-    log.info("Stage 2: cached %d snapshot analyses -> %s", len(snapshots), cache_path)
-    return snapshots
+        # Persist progress after every batch (crash / quota safety)
+        all_cached = [
+            cached_by_id[kf.segment_id]
+            for kf in keyframes
+            if kf.segment_id in cached_by_id
+        ]
+        cache_path.write_text(json.dumps(all_cached, indent=2))
+        log.info(
+            "Stage 2b: %d/%d snapshots saved after batch %d/%d",
+            len(all_cached), len(keyframes), batch_idx + 1, len(batches),
+        )
+
+    # Return all keyframes; segments without analysis become empty BoardSnapshots
+    return [
+        _parse_snapshot(cached_by_id.get(
+            kf.segment_id, {"_segment_id": kf.segment_id, "_timestamp": kf.timestamp}
+        ))
+        for kf in keyframes
+    ]

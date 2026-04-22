@@ -4,17 +4,11 @@ from dataclasses import dataclass, field
 
 log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# States
-# ---------------------------------------------------------------------------
 B = "B"   # Blank
 I = "I"   # Idle
 O = "O"   # Operating
 E = "E"   # Erasing
 
-# ---------------------------------------------------------------------------
-# Input symbols
-# ---------------------------------------------------------------------------
 SIG_C = "CREATION"
 SIG_A = "ADDITION"
 SIG_H = "HIGHLIGHTING"
@@ -23,19 +17,14 @@ SIG_D = "COMPLETE_ERASURE"
 OMEGA = "pen_lift"      # activity segment ends (pen-lift from Stage 1)
 TAU   = "idle_timeout"  # no activity for > IDLE_TIMEOUT seconds
 
-# ---------------------------------------------------------------------------
-# Output tokens
-# ---------------------------------------------------------------------------
+
 OUT_S   = "S"   # emit static IR snapshot
 OUT_P   = "P"   # emit operation IR
 OUT_SP  = "SP"  # emit both
 OUT_EPS = ""    # epsilon -- emit nothing
 
-# ---------------------------------------------------------------------------
-# Transition table  (state, input) -> (next_state, output)
-# Defined exactly per intermediate-representation/README.md lines 248-342.
-# ---------------------------------------------------------------------------
 _TABLE: dict[tuple[str, str], tuple[str, str]] = {
+    # Core spec (README.md §Mealy table)
     (B, SIG_C): (O, OUT_P),
     (B, TAU):   (B, OUT_EPS),
     (I, SIG_A): (O, OUT_SP),
@@ -45,6 +34,32 @@ _TABLE: dict[tuple[str, str], tuple[str, str]] = {
     (I, TAU):   (I, OUT_S),
     (O, OMEGA): (I, OUT_S),
     (E, OMEGA): (B, OUT_EPS),
+
+
+
+    # From B: VLM misclassified the initial drawing (missed that the board was
+    # blank).  Any drawing operation from blank implies an implicit creation.
+    (B, SIG_A): (O, OUT_P),    # ADDITION on blank → treat as CREATION, emit P
+    (B, SIG_H): (O, OUT_P),    # HIGHLIGHTING on blank → treat as CREATION, emit P
+    (B, SIG_E): (B, OUT_EPS),  # ERASURE on blank → nonsensical, no-op
+    (B, SIG_D): (B, OUT_EPS),  # COMPLETE_ERASURE on blank → nonsensical, no-op
+    (B, OMEGA): (B, OUT_EPS),  # pen-lift on blank → no-op
+
+    # From O: VLM collapsed consecutive operations (no pen-lift emitted between
+    # them).  Emit P for the new operation and stay in O (or move to E/I).
+    (O, SIG_A): (O, OUT_P),    # back-to-back ADDITION → emit P, stay O
+    (O, SIG_H): (O, OUT_P),    # HIGHLIGHTING without preceding pen-lift
+    (O, SIG_E): (E, OUT_P),    # ERASURE without preceding pen-lift
+    (O, SIG_D): (E, OUT_P),    # COMPLETE_ERASURE without preceding pen-lift
+    (O, TAU):   (I, OUT_EPS),  # timeout while operating → go idle
+
+    # From E: new operations arrive before the erasing pen-lift.
+    (E, SIG_C): (O, OUT_P),    # new creation after erasure (no intervening pen-lift)
+    (E, SIG_A): (O, OUT_P),    # addition after erasure (no intervening pen-lift)
+    (E, SIG_H): (O, OUT_P),    # highlighting after erasure (no intervening pen-lift)
+    (E, SIG_E): (E, OUT_EPS),  # more erasure while already erasing
+    (E, SIG_D): (E, OUT_EPS),  # more complete erasure while already erasing
+    (E, TAU):   (B, OUT_EPS),  # erasure timed out → treat board as blank
 }
 
 

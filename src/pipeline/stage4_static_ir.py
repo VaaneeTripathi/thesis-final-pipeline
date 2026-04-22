@@ -21,6 +21,7 @@ import datetime
 import logging
 from typing import Any
 
+from pipeline import config
 from pipeline.models import BoardSnapshot, ElementRegistry
 
 log = logging.getLogger(__name__)
@@ -55,17 +56,46 @@ def _assign_node_ids(
 
     Nodes are sorted by centroid (y bucketed into rows of 50 px, then x)
     to follow the left-to-right, level-by-level convention.
-    Marks that CV or VLM classifies as connections or annotations are excluded.
+
+    Filtering priority (per design contract: VLM is semantic ground truth):
+      1. If VLM says "node" → always include, even if CV called it a connection.
+      2. If VLM says "connection" or "annotation" → always exclude.
+      3. If VLM has no opinion (mark absent from mark_descriptions) → fall back
+         to CV: exclude only if CV shape_type is in _CONNECTION_SHAPES.
+
+    Fallback when the primary pass yields no nodes:
+      - Relax to: include anything CV didn't call a connection (drops VLM filter).
+      If still empty, return {} — build() will skip this snapshot rather than
+      emit an invalid schema with an empty nodes array.
     """
     node_regions = []
     for mark_id, region in registry.elements.items():
-        if region.shape_type in _CONNECTION_SHAPES:
-            continue
-        vlm_type = mark_descriptions.get(mark_id, {}).get("element_type", "node")
-        if vlm_type in {"connection", "annotation"}:
-            continue
-        node_regions.append(region)
+        vlm_type = mark_descriptions.get(mark_id, {}).get("element_type")
 
+        if vlm_type == "node":
+            # VLM explicitly says node — include regardless of CV shape
+            node_regions.append(region)
+        elif vlm_type in {"connection", "annotation"}:
+            # VLM explicitly says not a node — exclude
+            continue
+        else:
+            # VLM has no opinion; defer to CV geometry
+            if region.shape_type not in _CONNECTION_SHAPES:
+                node_regions.append(region)
+
+    # Fallback: if VLM excluded everything but CV has non-connection marks,
+    # trust CV geometry over VLM classification (VLM often misclassifies SoM
+    # overlay marks as "annotation").
+    if not node_regions:
+        log.debug(
+            "_assign_node_ids: primary pass found 0 nodes — "
+            "falling back to CV-geometry-only filter"
+        )
+        for mark_id, region in registry.elements.items():
+            if region.shape_type not in _CONNECTION_SHAPES:
+                node_regions.append(region)
+
+    # If still nothing, return empty — build() will skip this snapshot.
     node_regions.sort(key=lambda r: (r.centroid[1] // 50, r.centroid[0]))
     return {r.mark_id: f"n{i + 1}" for i, r in enumerate(node_regions)}
 
@@ -74,7 +104,7 @@ def build(
     registry: ElementRegistry,
     snapshot: BoardSnapshot,
     time_taken: str = "00:00",
-) -> dict:
+) -> dict | None:
     """Build a static-schema.json-conformant dict from CV geometry + VLM snapshot.
 
     Args:
@@ -83,11 +113,30 @@ def build(
         time_taken: Wall-clock analysis duration in MM:SS.
 
     Returns:
-        dict conforming to static-schema.json.
+        dict conforming to static-schema.json, or None if the registry has no
+        marks at all (empty board — nothing to serialize).
         Node IDs are n1, n2, ... — no SoM mark IDs appear in the output.
     """
+    if not registry.elements:
+        log.warning(
+            "stage4.build: registry is empty (no CV marks) — skipping static IR "
+            "for snapshot at %.1fs",
+            snapshot.timestamp,
+        )
+        return None
+
     mark_descriptions = snapshot.mark_descriptions
     mark_to_nid = _assign_node_ids(registry, mark_descriptions)
+
+    if not mark_to_nid:
+        log.warning(
+            "stage4.build: _assign_node_ids found 0 nodes (registry has %d marks, "
+            "all classified as connections/annotations) — skipping static IR at %.1fs",
+            len(registry.elements),
+            snapshot.timestamp,
+        )
+        return None
+
     valid_mark_ids = set(mark_to_nid.keys())
 
     
@@ -266,7 +315,7 @@ def build(
         "state": state,
         "semantics": semantics,
         "provenance": {
-            "model": "gemini-2.5-flash + opencv-cv",
+            "model": f"{config.VLM_MODEL} + opencv-cv",
             "confidence": snapshot.confidence,
             "visibility_issues": snapshot.visibility_issues,
             "time_taken": time_taken,

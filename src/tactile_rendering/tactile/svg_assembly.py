@@ -1,17 +1,20 @@
-"""Stage 4: Structural SVG assembly.
+"""Stage 4: Structural SVG assembly — diagram only (not the key).
 
-Takes a LayoutResult and a Flowchart and emits:
-  1. A tactile-ready SVG with BANA-aligned line weights, node shapes,
-     routed edges, arrowheads, and numeric legend IDs inside nodes.
-  2. A sidecar JSON with the legend table, braille translations, and
-     BANA conformance metadata.
+Produces a tactile-ready SVG of the flowchart with:
+  - BANA-compliant line weights and node shapes
+  - A bold numeric legend ID centred inside each node
+  - Filled arrowheads on directed edges
+  - Clean canvas margins
+
+The key (label lookup) is produced separately in stage 5 (legend.py).
+
+BANA line-weight rule: minimum 0.5 mm.  1.5 mm is recommended for
+embossing and is the value used here.
 """
 
 from __future__ import annotations
 
-import json
 import math
-from dataclasses import asdict
 from pathlib import Path
 
 import svgwrite
@@ -20,246 +23,207 @@ from tactile.ir import Flowchart
 from tactile.layout import LayoutResult, NodeLayout, EdgeLayout
 from tactile.braille import transcribe_labels, BrailleLabel
 
-# --- Constants ---
-
-# Conversion: Graphviz uses inches; we convert to mm for BANA alignment.
 INCHES_TO_MM = 25.4
 
-# BANA minimum line weight is 0.5 mm; we use 1 mm for better tactile discrimination.
-STROKE_WIDTH_MM = 1.0
+# Line weight: BANA minimum is 0.5 mm; 1.5 mm suits embossing and the
+# 60×40 pin grid (a 1 mm line covers less than half a pin at 2.4 mm pitch).
+STROKE_WIDTH_MM = 1.5
 
-# Arrow head size in mm.
-ARROW_SIZE_MM = 3.0
+# Dashed/dotted line segments (BANA: dash 6–10 mm, gap ≈ half dash).
+DASH_MM  = 7.0
+GAP_MM   = 3.5
 
-# Font size for numeric IDs inside nodes (in mm).
-LABEL_FONT_MM = 4.0
+# Arrowhead: filled solid triangle, 5 mm base.
+ARROW_SIZE_MM = 5.0
+
+# Number inside node: 5 mm keeps the digit from visually dominating the outline.
+# Note: font-size is specified as a bare user-unit number (not "Xmm") so that
+# CairoSVG's 72-DPI mm resolver doesn't produce a different size than the
+# 300-DPI viewBox scale used for rasterisation.
+NODE_NUM_FONT_MM = 5.0
+
+# Canvas margin around the graph bounding box.
+CANVAS_MARGIN_MM = 15.0
 
 
-def _inches_to_mm(val: float) -> float:
-    return val * INCHES_TO_MM
+def _mm(inches: float) -> float:
+    return inches * INCHES_TO_MM
 
 
-def _draw_node_shape(
-    dwg: svgwrite.Drawing,
-    nl: NodeLayout,
-    legend_num: int,
-) -> None:
-    """Draw a node shape and its numeric legend ID."""
-    cx = _inches_to_mm(nl.cx)
-    cy = _inches_to_mm(nl.cy)
-    w = _inches_to_mm(nl.width)
-    h = _inches_to_mm(nl.height)
-    half_w = w / 2
-    half_h = h / 2
+def _stroke_attrs(line_type: str = "solid") -> dict:
+    base = {"stroke": "black", "stroke_width": STROKE_WIDTH_MM, "fill": "none"}
+    if line_type == "dashed":
+        base["stroke_dasharray"] = f"{DASH_MM},{GAP_MM}"
+    elif line_type == "dotted":
+        base["stroke_dasharray"] = f"{STROKE_WIDTH_MM},{GAP_MM}"
+    return base
 
-    stroke_attrs = {
-        "stroke": "black",
-        "stroke_width": STROKE_WIDTH_MM,
-        "fill": "none",
-    }
 
-    if nl.shape == "rectangle" or nl.shape == "other":
-        dwg.add(dwg.rect(
-            insert=(cx - half_w, cy - half_h),
-            size=(w, h),
-            **stroke_attrs,
-        ))
+def _draw_node_shape(dwg: svgwrite.Drawing, nl: NodeLayout, legend_num: int) -> None:
+    """Draw the node outline and its numeric ID centred inside."""
+    cx  = _mm(nl.cx)
+    cy  = _mm(nl.cy)
+    w   = _mm(nl.width)
+    h   = _mm(nl.height)
+    hw  = w / 2
+    hh  = h / 2
+    sa  = _stroke_attrs()
 
-    elif nl.shape == "rounded-rectangle":
-        corner = min(w, h) * 0.2
-        dwg.add(dwg.rect(
-            insert=(cx - half_w, cy - half_h),
-            size=(w, h),
-            rx=corner, ry=corner,
-            **stroke_attrs,
-        ))
+    shape = nl.shape
 
-    elif nl.shape == "diamond":
-        points = [
-            (cx, cy - half_h),
-            (cx + half_w, cy),
-            (cx, cy + half_h),
-            (cx - half_w, cy),
+    if shape in ("rectangle", "other"):
+        dwg.add(dwg.rect(insert=(cx - hw, cy - hh), size=(w, h), **sa))
+
+    elif shape == "rounded-rectangle":
+        corner = min(w, h) * 0.18
+        dwg.add(dwg.rect(insert=(cx - hw, cy - hh), size=(w, h),
+                         rx=corner, ry=corner, **sa))
+
+    elif shape == "diamond":
+        pts = [(cx, cy - hh), (cx + hw, cy), (cx, cy + hh), (cx - hw, cy)]
+        dwg.add(dwg.polygon(pts, **sa))
+
+    elif shape in ("oval", "ellipse"):
+        dwg.add(dwg.ellipse(center=(cx, cy), r=(hw, hh), **sa))
+
+    elif shape == "circle":
+        dwg.add(dwg.circle(center=(cx, cy), r=min(hw, hh), **sa))
+
+    elif shape == "parallelogram":
+        slant = hw * 0.25
+        pts = [
+            (cx - hw + slant, cy - hh), (cx + hw,         cy - hh),
+            (cx + hw - slant, cy + hh), (cx - hw,         cy + hh),
         ]
-        dwg.add(dwg.polygon(points, **stroke_attrs))
+        dwg.add(dwg.polygon(pts, **sa))
 
-    elif nl.shape in ("oval", "ellipse"):
-        dwg.add(dwg.ellipse(
-            center=(cx, cy),
-            r=(half_w, half_h),
-            **stroke_attrs,
-        ))
-
-    elif nl.shape == "circle":
-        r = min(half_w, half_h)
-        dwg.add(dwg.circle(center=(cx, cy), r=r, **stroke_attrs))
-
-    elif nl.shape == "parallelogram":
-        slant = half_w * 0.25
-        points = [
-            (cx - half_w + slant, cy - half_h),
-            (cx + half_w, cy - half_h),
-            (cx + half_w - slant, cy + half_h),
-            (cx - half_w, cy + half_h),
-        ]
-        dwg.add(dwg.polygon(points, **stroke_attrs))
-
-    elif nl.shape == "triangle":
-        points = [
-            (cx, cy - half_h),
-            (cx + half_w, cy + half_h),
-            (cx - half_w, cy + half_h),
-        ]
-        dwg.add(dwg.polygon(points, **stroke_attrs))
+    elif shape == "triangle":
+        pts = [(cx, cy - hh), (cx + hw, cy + hh), (cx - hw, cy + hh)]
+        dwg.add(dwg.polygon(pts, **sa))
 
     else:
-        # Fallback to rectangle for unknown shapes.
-        dwg.add(dwg.rect(
-            insert=(cx - half_w, cy - half_h),
-            size=(w, h),
-            **stroke_attrs,
-        ))
+        dwg.add(dwg.rect(insert=(cx - hw, cy - hh), size=(w, h), **sa))
 
-    # Numeric legend ID centered in node.
-    # At 60×40 rasterization a digit needs ~3 pins tall to be legible,
-    # which requires ~3mm font-size given typical pin spacing. Non-bold
-    # keeps the strokes from merging with the box outline at low res.
-    font_mm = min(h * 0.35, w * 0.2)
+    # Numeric ID — centred in the node.
+    # y is set so the cap-height midpoint lands on the node centre.
+    # cap_height ≈ 0.7 × font_size; we shift baseline down by half that.
+    # font_size is in user units (= mm) with no "mm" suffix to avoid
+    # CairoSVG resolving mm at 72 DPI independently of the raster scale.
+    text_y = cy + NODE_NUM_FONT_MM * 0.35
     dwg.add(dwg.text(
         str(legend_num),
-        insert=(cx, cy),
+        insert=(cx, text_y),
         text_anchor="middle",
-        dominant_baseline="central",
-        font_size=f"{font_mm:.2f}mm",
-        font_family="sans-serif",
+        font_size=str(NODE_NUM_FONT_MM),
+        font_family="Helvetica, Arial, sans-serif",
+        font_weight="bold",
         fill="black",
     ))
 
 
-def _draw_arrowhead(
-    dwg: svgwrite.Drawing,
-    tip_x: float,
-    tip_y: float,
-    from_x: float,
-    from_y: float,
-) -> None:
-    """Draw a filled triangular arrowhead at (tip_x, tip_y)."""
-    dx = tip_x - from_x
-    dy = tip_y - from_y
-    length = math.sqrt(dx * dx + dy * dy)
+def _draw_arrowhead(dwg: svgwrite.Drawing,
+                    tip_x: float, tip_y: float,
+                    from_x: float, from_y: float) -> None:
+    """Filled triangular arrowhead at (tip_x, tip_y) pointing away from (from_x, from_y)."""
+    dx, dy = tip_x - from_x, tip_y - from_y
+    length = math.hypot(dx, dy)
     if length == 0:
         return
+    ux, uy = dx / length, dy / length   # unit vector along edge
+    px, py = -uy, ux                    # perpendicular
 
-    # Unit vector along the edge direction.
-    ux, uy = dx / length, dy / length
-    # Perpendicular.
-    px, py = -uy, ux
+    base_x = tip_x - ux * ARROW_SIZE_MM
+    base_y = tip_y - uy * ARROW_SIZE_MM
+    half   = ARROW_SIZE_MM * 0.45
 
-    size = ARROW_SIZE_MM
-    base_x = tip_x - ux * size
-    base_y = tip_y - uy * size
-    half = size * 0.4
-
-    points = [
+    pts = [
         (tip_x, tip_y),
         (base_x + px * half, base_y + py * half),
         (base_x - px * half, base_y - py * half),
     ]
-    dwg.add(dwg.polygon(points, fill="black", stroke="none"))
+    dwg.add(dwg.polygon(pts, fill="black", stroke="none"))
 
 
-def _draw_edge(dwg: svgwrite.Drawing, el: EdgeLayout) -> None:
-    """Draw an edge as a polyline with optional arrowheads."""
+def _draw_edge(dwg: svgwrite.Drawing, el: EdgeLayout, line_type: str = "solid") -> None:
     if len(el.points) < 2:
         return
 
-    mm_points = [(_inches_to_mm(x), _inches_to_mm(y)) for x, y in el.points]
+    pts_mm = [(_mm(x), _mm(y)) for x, y in el.points]
 
-    dwg.add(dwg.polyline(
-        mm_points,
-        stroke="black",
-        stroke_width=STROKE_WIDTH_MM,
-        fill="none",
-    ))
+    dwg.add(dwg.polyline(pts_mm, **_stroke_attrs(line_type)))
 
-    # Forward arrow at the last point.
     if el.direction in ("forward", "bidirectional"):
-        tip = mm_points[-1]
-        prev = mm_points[-2]
-        _draw_arrowhead(dwg, tip[0], tip[1], prev[0], prev[1])
-
-    # Backward arrow at the first point.
+        _draw_arrowhead(dwg, pts_mm[-1][0], pts_mm[-1][1],
+                        pts_mm[-2][0], pts_mm[-2][1])
     if el.direction in ("backward", "bidirectional"):
-        tip = mm_points[0]
-        prev = mm_points[1]
-        _draw_arrowhead(dwg, tip[0], tip[1], prev[0], prev[1])
+        _draw_arrowhead(dwg, pts_mm[0][0], pts_mm[0][1],
+                        pts_mm[1][0], pts_mm[1][1])
 
 
 def assemble(
     flowchart: Flowchart,
     layout: LayoutResult,
 ) -> tuple[svgwrite.Drawing, list[BrailleLabel], dict]:
-    """Assemble the structural SVG, braille labels, and sidecar metadata.
+    """Assemble the diagram SVG, braille labels, and sidecar metadata.
 
     Returns:
         (svg_drawing, braille_labels, sidecar_dict)
     """
-    # Build legend labels from node order.
+    # Build legend mapping: node order → sequential number starting at 1.
     label_pairs = [(n.id, n.text or n.id) for n in flowchart.nodes]
     braille_labels = transcribe_labels(label_pairs)
 
-    # Also transcribe connection labels.
-    conn_label_pairs = [
-        (c.id, c.label) for c in flowchart.connections if c.label
-    ]
+    # Connection labels continue numbering after nodes.
+    conn_label_pairs = [(c.id, c.label) for c in flowchart.connections if c.label]
     if conn_label_pairs:
-        conn_braille = transcribe_labels(
-            [(cid, lbl) for cid, lbl in conn_label_pairs]
-        )
-        # Continue numbering from where node labels left off.
+        conn_braille = transcribe_labels(conn_label_pairs)
         offset = len(braille_labels)
-        for bl in conn_braille:
-            bl.legend_number = offset + conn_braille.index(bl) + 1
+        for i, bl in enumerate(conn_braille):
+            bl.legend_number = offset + i + 1
         braille_labels.extend(conn_braille)
 
-    # SVG canvas: graph dimensions in mm plus margin.
-    margin_mm = 10.0
-    canvas_w = _inches_to_mm(layout.graph_width) + 2 * margin_mm
-    canvas_h = _inches_to_mm(layout.graph_height) + 2 * margin_mm
+    # Build connection line-type lookup.
+    conn_line_type: dict[str, str] = {
+        c.id: c.line_type for c in flowchart.connections
+    }
+
+    # SVG canvas.
+    m = CANVAS_MARGIN_MM
+    canvas_w = _mm(layout.graph_width)  + 2 * m
+    canvas_h = _mm(layout.graph_height) + 2 * m
 
     dwg = svgwrite.Drawing(
         size=(f"{canvas_w}mm", f"{canvas_h}mm"),
-        viewBox=f"{-margin_mm} {-margin_mm} {canvas_w} {canvas_h}",
+        viewBox=f"{-m} {-m} {canvas_w} {canvas_h}",
     )
 
-    # Build node_id -> legend_number lookup.
     legend_lookup = {
         label_pairs[i][0]: braille_labels[i].legend_number
         for i in range(len(label_pairs))
     }
 
-    # Draw edges first (so nodes are on top).
+    # Edges behind nodes.
     for edge in layout.edges:
-        _draw_edge(dwg, edge)
+        lt = conn_line_type.get(edge.id, "solid")
+        _draw_edge(dwg, edge, lt)
 
-    # Draw nodes.
+    # Nodes on top.
     for node_id, nl in layout.nodes.items():
-        legend_num = legend_lookup.get(node_id, 0)
-        _draw_node_shape(dwg, nl, legend_num)
+        _draw_node_shape(dwg, nl, legend_lookup.get(node_id, 0))
 
-    # Build sidecar metadata.
     sidecar = {
         "source_ir_id": flowchart.id,
-        "label_strategy": "legend",
+        "label_strategy": "key",
         "bana_conformance": {
-            "stroke_width_mm": STROKE_WIDTH_MM,
-            "arrow_size_mm": ARROW_SIZE_MM,
-            "label_font_mm": LABEL_FONT_MM,
+            "stroke_width_mm":   STROKE_WIDTH_MM,
+            "arrow_size_mm":     ARROW_SIZE_MM,
+            "node_num_font_mm":  NODE_NUM_FONT_MM,
+            "canvas_margin_mm":  CANVAS_MARGIN_MM,
         },
         "legend": [
             {
-                "number": bl.legend_number,
-                "print_text": bl.print_text,
+                "number":      bl.legend_number,
+                "print_text":  bl.print_text,
                 "braille_text": bl.braille_text,
             }
             for bl in braille_labels

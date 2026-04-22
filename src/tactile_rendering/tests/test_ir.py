@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 from jsonschema import validate, Draft202012Validator
 
-SCHEMA_PATH = Path(__file__).resolve().parents[2] / "intermediate-representation" / "static-schema.json"
+SCHEMA_PATH = Path(__file__).resolve().parents[3] / "schemas" / "static-schema.json"
 FIXTURE_PATH = Path(__file__).resolve().parent.parent / "fixtures" / "v1_simple_flowchart.json"
 
 

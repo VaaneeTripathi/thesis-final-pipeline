@@ -21,8 +21,10 @@ Usage:
 """
 from __future__ import annotations
 import datetime
+import json
 import logging
 import shutil
+import tempfile
 import time
 from pathlib import Path
 
@@ -37,7 +39,12 @@ from pipeline import (
     stage7_tactile,
     stage8_transcript,
 )
-from pipeline.models import BoardSnapshot, ElementRegistry, VLMOperation
+import numpy as np
+
+from pipeline.models import (
+    BoardSnapshot, DetectedRegion, ElementRegistry,
+    KeyframeAnnotation, TemporalSegment, VLMOperation,
+)
 from pipeline.stage3_mealy import (
     MealyMachine,
     OMEGA, TAU,
@@ -138,6 +145,9 @@ def _process_operations(
             log.warning("S emission skipped (%s): no board snapshot available", label)
             return
         snap = stage4_static_ir.build(registry, board_snap, time_taken=time_taken_str)
+        if snap is None:
+            log.warning("S emission skipped (%s): empty registry — no marks to serialize", label)
+            return
         snapshots.append(snap)
         log.debug("Emitted S (%s)", label)
 
@@ -207,23 +217,36 @@ def _process_operations(
     return snapshots, operation_doc, mealy
 
 
-# Cache files are preserved across runs — they represent expensive VLM API
-# calls. Delete them manually to force a fresh analysis.
-_CACHE_FILES = {"vlm_cache.json", "snapshot_cache.json"}
+# Cache files are preserved across runs — delete manually to force a fresh run.
+# stage1_cache.json covers the CV stage; vlm_cache/snapshot_cache cover VLM calls.
+_CACHE_FILES = {"vlm_cache.json", "snapshot_cache.json", "stage1_cache.json"}
+
+_STAGE1_CACHE = "stage1_cache.json"
 
 
 def _clean_output_dir(output_dir: Path) -> None:
-    """Wipe output_dir and recreate it, preserving any VLM cache files.
+    """Wipe output_dir and recreate it, preserving cache files and keyframes/.
 
-    Called at the start of every run so stale outputs from a previous run
-    never contaminate the current one.
+    The keyframes/ directory is moved to a temp location and restored after
+    the wipe — this avoids reading all PNGs into memory while still keeping
+    them alongside their stage1_cache.json metadata.
     """
     saved: dict[str, str] = {}
+    tmp_keyframes: Path | None = None
+
     if output_dir.exists():
         for fname in _CACHE_FILES:
             p = output_dir / fname
             if p.exists():
                 saved[fname] = p.read_text(encoding="utf-8")
+
+        # Preserve keyframes/ only when the stage 1 cache is also present
+        kf_dir = output_dir / "keyframes"
+        if kf_dir.exists() and (output_dir / _STAGE1_CACHE).exists():
+            tmp_parent = Path(tempfile.mkdtemp())
+            tmp_keyframes = tmp_parent / "keyframes"
+            shutil.move(str(kf_dir), str(tmp_keyframes))
+
         shutil.rmtree(output_dir)
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -231,10 +254,149 @@ def _clean_output_dir(output_dir: Path) -> None:
     for fname, content in saved.items():
         (output_dir / fname).write_text(content, encoding="utf-8")
 
-    if saved:
-        log.info("Output directory cleaned (caches preserved: %s)", ", ".join(sorted(saved)))
+    if tmp_keyframes and tmp_keyframes.exists():
+        shutil.move(str(tmp_keyframes), str(output_dir / "keyframes"))
+        shutil.rmtree(str(tmp_keyframes.parent))
+
+    preserved = sorted(saved) + (["keyframes/"] if tmp_keyframes else [])
+    if preserved:
+        log.info("Output directory cleaned (preserved: %s)", ", ".join(preserved))
     else:
         log.info("Output directory cleaned")
+
+
+class _NumpyEncoder(json.JSONEncoder):
+    """JSON encoder that converts numpy scalars/arrays to Python native types."""
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
+
+def _save_stage1_cache(
+    registry: ElementRegistry,
+    segments: list,
+    registry_snapshots: list,
+    keyframe_annotations: list,
+    output_dir: Path,
+) -> None:
+    """Persist stage 1 outputs to stage1_cache.json."""
+
+    def _reg_to_dict(reg: ElementRegistry) -> dict:
+        return {
+            "next_id": reg.next_id,
+            "elements": {
+                str(k): {
+                    "mark_id": v.mark_id,
+                    "bbox": list(v.bbox),
+                    "shape_type": v.shape_type,
+                    "centroid": list(v.centroid),
+                    "first_seen": v.first_seen,
+                }
+                for k, v in reg.elements.items()
+            },
+        }
+
+    data = {
+        "registry": _reg_to_dict(registry),
+        "segments": [
+            {
+                "segment_id": s.segment_id,
+                "timestamp_start": s.timestamp_start,
+                "timestamp_end": s.timestamp_end,
+                "segment_type": s.segment_type,
+                "delta_magnitude": s.delta_magnitude,
+            }
+            for s in segments
+        ],
+        "registry_snapshots": [_reg_to_dict(r) for r in registry_snapshots],
+        "keyframe_annotations": [
+            {
+                "segment_id": k.segment_id,
+                "timestamp": k.timestamp,
+                "image_path": str(k.image_path),
+                "marks": k.marks,
+            }
+            for k in keyframe_annotations
+        ],
+    }
+    (output_dir / _STAGE1_CACHE).write_text(
+        json.dumps(data, indent=2, cls=_NumpyEncoder), encoding="utf-8"
+    )
+    log.info("Stage 1: cache written → %s", _STAGE1_CACHE)
+
+
+def _load_stage1_cache(
+    output_dir: Path,
+) -> tuple | None:
+    """Load stage 1 cache if present and all keyframe PNGs still exist.
+
+    Returns (registry, segments, registry_snapshots, keyframe_annotations)
+    or None if the cache is absent or stale.
+    """
+    cache_path = output_dir / _STAGE1_CACHE
+    if not cache_path.exists():
+        return None
+
+    data = json.loads(cache_path.read_text(encoding="utf-8"))
+
+    def _dict_to_reg(d: dict) -> ElementRegistry:
+        reg = ElementRegistry()
+        reg.next_id = d["next_id"]
+        for k, v in d["elements"].items():
+            reg.elements[int(k)] = DetectedRegion(
+                mark_id=v["mark_id"],
+                bbox=tuple(v["bbox"]),
+                shape_type=v["shape_type"],
+                centroid=tuple(v["centroid"]),
+                contour=np.array([]),   # not used downstream
+                first_seen=v["first_seen"],
+            )
+        return reg
+
+    registry = _dict_to_reg(data["registry"])
+
+    segments = [
+        TemporalSegment(
+            segment_id=s["segment_id"],
+            timestamp_start=s["timestamp_start"],
+            timestamp_end=s["timestamp_end"],
+            segment_type=s["segment_type"],
+            delta_magnitude=s["delta_magnitude"],
+            keyframe_before=np.array([]),  # not used downstream
+            keyframe_after=np.array([]),   # not used downstream
+        )
+        for s in data["segments"]
+    ]
+
+    registry_snapshots = [_dict_to_reg(r) for r in data["registry_snapshots"]]
+
+    keyframe_annotations = []
+    for k in data["keyframe_annotations"]:
+        img_path = Path(k["image_path"])
+        if not img_path.exists():
+            log.warning(
+                "Stage 1 cache stale: keyframe PNG missing (%s) — re-running stage 1",
+                img_path,
+            )
+            return None
+        keyframe_annotations.append(
+            KeyframeAnnotation(
+                segment_id=k["segment_id"],
+                timestamp=k["timestamp"],
+                image_path=img_path,
+                marks=k["marks"],
+            )
+        )
+
+    log.info(
+        "Stage 1: loaded from cache (%d segments, %d keyframes)",
+        len(segments), len(keyframe_annotations),
+    )
+    return registry, segments, registry_snapshots, keyframe_annotations
 
 
 def run(video_path: Path, output_dir: Path) -> None:
@@ -259,23 +421,28 @@ def run(video_path: Path, output_dir: Path) -> None:
     log.info("=== Pipeline start: %s ===", video_path.name)
     _clean_output_dir(output_dir)
 
-    # --- Stage 0: ingest ---
+    # Stage 0: ingest
     cap, ingest_data = stage0_ingest.ingest(video_path)
 
-    try:
-        # --- Stage 1: CV temporal segmentation + keyframe annotation ---
-        registry, segments, registry_snapshots, keyframe_annotations = stage1_cv.run(
-            cap, ingest_data, output_dir,
-        )
-    finally:
+    # Stage 1: CV temporal segmentation + keyframe annotation
+    stage1_result = _load_stage1_cache(output_dir)
+    if stage1_result is not None:
         cap.release()
+        registry, segments, registry_snapshots, keyframe_annotations = stage1_result
+    else:
+        try:
+            registry, segments, registry_snapshots, keyframe_annotations = stage1_cv.run(
+                cap, ingest_data, output_dir,
+            )
+        finally:
+            cap.release()
+        _save_stage1_cache(registry, segments, registry_snapshots, keyframe_annotations, output_dir)
+        log.info(
+            "Stage 1: %d segments, %d final marks, %d keyframes",
+            len(segments), len(registry.elements), len(keyframe_annotations),
+        )
 
-    log.info(
-        "Stage 1: %d segments, %d final marks, %d keyframes",
-        len(segments), len(registry.elements), len(keyframe_annotations),
-    )
-
-    # --- Stage 2a: VLM operation analysis (whole video) ---
+    # Stage 2a: VLM operation analysis (whole video) 
     operations = stage2_vlm.run(
         video_path=video_path,
         registry=registry,
@@ -287,7 +454,7 @@ def run(video_path: Path, output_dir: Path) -> None:
     if not operations:
         log.warning("No VLM operations — pipeline output will be empty.")
 
-    # --- Stage 2b: VLM snapshot analysis (per-keyframe, for static IR) ---
+    #  Stage 2b: VLM snapshot analysis (per-keyframe, for static IR) 
     board_snapshots = stage2_vlm.analyse_snapshots(
         keyframes=keyframe_annotations,
         snapshot_registries=registry_snapshots,
@@ -295,7 +462,7 @@ def run(video_path: Path, output_dir: Path) -> None:
     )
     log.info("Stage 2b: %d board snapshots analysed", len(board_snapshots))
 
-    # --- Stages 3–5: Mealy machine + IR assembly ---
+    # Stages 3–5: Mealy machine + IR assembly 
     analysis_timestamp = datetime.datetime.utcnow().isoformat() + "Z"
     time_taken_str = _seconds_to_mmss(time.time() - wall_start)
 
@@ -315,7 +482,7 @@ def run(video_path: Path, output_dir: Path) -> None:
     n_ops_out = len(operation_doc.get("analysis", {}).get("operations", []))
     log.info("Stages 3–5: %d snapshots, %d operation entries", len(snapshots), n_ops_out)
 
-    # --- Stage 6: validate + semantic deltas ---
+    # Stage 6: validate + semantic deltas
     report, deltas = stage6_validate.run(
         snapshots=snapshots,
         operation_doc=operation_doc,
@@ -327,21 +494,21 @@ def run(video_path: Path, output_dir: Path) -> None:
         len(deltas), report.is_valid, len(report.all_errors),
     )
 
-    # --- Stage 7: tactile rendering (graceful skip if not installed) ---
+    # Stage 7: tactile rendering (graceful skip if not installed) 
     tactile_dirs = stage7_tactile.run(output_dir)
     if tactile_dirs:
         log.info("Stage 7: %d snapshot(s) rendered tactilely", len(tactile_dirs))
     else:
         log.info("Stage 7: tactile rendering skipped or no snapshots to render")
 
-    # --- Stage 8: transcript ---
+    # Stage 8: transcript 
     txt_path, json_path = stage8_transcript.generate(operation_doc, output_dir)
     log.info("Stage 8: transcript written → %s", txt_path.name)
 
-    # --- Final summary ---
+   
     wall_elapsed = time.time() - wall_start
     log.info(
-        "=== Pipeline complete in %.1fs — valid=%s, errors=%d ===",
+        "Pipeline complete in %.1fs — valid=%s, errors=%d",
         wall_elapsed, report.is_valid, len(report.all_errors),
     )
 

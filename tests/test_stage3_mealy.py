@@ -12,11 +12,6 @@ from pipeline.stage3_mealy import (
     OUT_S, OUT_P, OUT_SP, OUT_EPS,
 )
 
-
-# ---------------------------------------------------------------------------
-# Individual transition tests (one row each)
-# ---------------------------------------------------------------------------
-
 def test_b_creation_to_o_emits_p():
     m = MealyMachine()
     assert m.state == B
@@ -81,10 +76,6 @@ def test_e_penlift_to_b_emits_eps():
     assert out == OUT_EPS
 
 
-# ---------------------------------------------------------------------------
-# Multi-step sequence tests
-# ---------------------------------------------------------------------------
-
 def test_full_creation_sequence():
     """B --CREATION--> O --pen_lift--> I"""
     m = MealyMachine()
@@ -147,9 +138,6 @@ def test_idle_timeout_emits_snapshot():
     assert m.state == I
 
 
-# ---------------------------------------------------------------------------
-# History recording
-# ---------------------------------------------------------------------------
 
 def test_history_recorded():
     m = MealyMachine()
@@ -173,9 +161,6 @@ def test_reset_clears_state():
     assert m.history == []
 
 
-# ---------------------------------------------------------------------------
-# Error recovery: undefined transitions
-# ---------------------------------------------------------------------------
 
 def test_undefined_transition_emits_eps_no_state_change():
     """CREATION from state I is undefined -- should log warning, not crash."""
@@ -194,9 +179,109 @@ def test_undefined_transition_from_o():
     assert m.state == O
 
 
-# ---------------------------------------------------------------------------
-# process_events helper
-# ---------------------------------------------------------------------------
+def test_b_addition_treated_as_creation():
+    """VLM misclassifies first drawing as ADDITION — machine should still emit P and move to O."""
+    m = MealyMachine()
+    out = m.step(SIG_A)
+    assert out == OUT_P
+    assert m.state == O
+
+
+def test_b_highlighting_treated_as_creation():
+    m = MealyMachine()
+    out = m.step(SIG_H)
+    assert out == OUT_P
+    assert m.state == O
+
+
+def test_b_erasure_is_noop():
+    m = MealyMachine()
+    out = m.step(SIG_E)
+    assert out == OUT_EPS
+    assert m.state == B
+
+
+def test_b_complete_erasure_is_noop():
+    m = MealyMachine()
+    out = m.step(SIG_D)
+    assert out == OUT_EPS
+    assert m.state == B
+
+
+def test_b_omega_is_noop():
+    m = MealyMachine()
+    out = m.step(OMEGA)
+    assert out == OUT_EPS
+    assert m.state == B
+
+
+def test_o_consecutive_addition_emits_p():
+    """Two ADDITIONs without pen-lift in between — both should emit P."""
+    m = MealyMachine(state=O)
+    out = m.step(SIG_A)
+    assert out == OUT_P
+    assert m.state == O
+
+
+def test_o_highlighting_emits_p():
+    m = MealyMachine(state=O)
+    out = m.step(SIG_H)
+    assert out == OUT_P
+    assert m.state == O
+
+
+def test_o_erasure_moves_to_e():
+    m = MealyMachine(state=O)
+    out = m.step(SIG_E)
+    assert out == OUT_P
+    assert m.state == E
+
+
+def test_o_complete_erasure_moves_to_e():
+    m = MealyMachine(state=O)
+    out = m.step(SIG_D)
+    assert out == OUT_P
+    assert m.state == E
+
+
+def test_o_tau_moves_to_i():
+    m = MealyMachine(state=O)
+    out = m.step(TAU)
+    assert out == OUT_EPS
+    assert m.state == I
+
+
+def test_e_addition_moves_to_o():
+    m = MealyMachine(state=E)
+    out = m.step(SIG_A)
+    assert out == OUT_P
+    assert m.state == O
+
+
+def test_e_tau_moves_to_b():
+    m = MealyMachine(state=E)
+    out = m.step(TAU)
+    assert out == OUT_EPS
+    assert m.state == B
+
+
+def test_all_addition_sequence_produces_output():
+    """Full sequence where VLM returns only ADDITIONs (no CREATION) — should produce real output."""
+    m = MealyMachine()
+    outputs = []
+    for _ in range(5):
+        outputs.append(m.step(SIG_A))  # ADDITION from B or I
+        outputs.append(m.step(OMEGA))  # pen-lift
+
+    # First ADDITION from B → P (implicit creation)
+    assert outputs[0] == OUT_P
+    # First OMEGA → S
+    assert outputs[1] == OUT_S
+    # Subsequent ADDITIONs from I → SP
+    assert all(o == OUT_SP for o in outputs[2::2])
+    # Subsequent OMEGAs → S
+    assert all(o == OUT_S for o in outputs[3::2])
+
 
 def test_process_events_returns_history():
     events = [

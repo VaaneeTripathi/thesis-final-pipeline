@@ -12,7 +12,7 @@ from pathlib import Path
 
 from jsonschema import Draft202012Validator, validate
 
-SCHEMA_PATH = Path(__file__).resolve().parents[3] / "intermediate-representation" / "static-schema.json"
+SCHEMA_PATH = Path(__file__).resolve().parents[3] / "schemas" / "static-schema.json"
 
 # Features that v1 does not handle — presence triggers a warning, not an error.
 _V1_UNSUPPORTED_WARNINGS = {

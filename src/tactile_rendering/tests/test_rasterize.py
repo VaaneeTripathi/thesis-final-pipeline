@@ -39,9 +39,11 @@ def test_grid_has_some_pins_up():
 def test_grid_is_not_all_on():
     svg = _get_svg_string()
     grid = rasterize(svg)
-    # Should not be solid — that would mean the thresholding is wrong.
+    # Should not be nearly solid black — that would mean thresholding is broken.
+    # Larger BANA-compliant nodes legitimately fill more of the grid, so we
+    # only fail if > 90% of pins are raised (which would indicate a rendering error).
     total = grid.shape[0] * grid.shape[1]
-    assert np.sum(grid) < total * 0.5
+    assert np.sum(grid) < total * 0.9
 
 
 def test_save_outputs():

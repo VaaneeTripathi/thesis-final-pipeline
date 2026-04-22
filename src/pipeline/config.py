@@ -32,7 +32,8 @@ CENTROID_MATCH_THRESHOLD = 50   # px — max distance to match element across fr
 
 # Stage 2: VLM
 VLM_MODEL = "gemini-2.5-flash"
-VLM_TIMEOUT = 1200
+VLM_TIMEOUT = 300
+SNAPSHOT_BATCH_SIZE = 10
 
 # Stage 3: Mealy
 IDLE_TIMEOUT = 30.0  # seconds with no activity → emit τ

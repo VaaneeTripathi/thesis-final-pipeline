@@ -4,12 +4,13 @@ Usage:
     python -m tactile.pipeline <ir_json_path> <output_dir>
 
 Runs all six stages and writes outputs to the specified directory:
-    - diagram.svg       (structural SVG with shapes, edges, numeric IDs)
-    - legend.svg        (numbered braille legend)
-    - tactile.json      (sidecar: legend table, braille, BANA metadata)
-    - grid.npy          (60×40 binary pin-grid matrix)
-    - grid.png          (debug visualization of the pin grid)
-    - layout_debug.svg  (raw Graphviz layout for visual inspection)
+    - diagram.svg           structural SVG: shapes, edges, numeric IDs inside nodes
+    - key_page_0001.svg     BANA-compliant key (embosser document, not pin grid)
+    - key_page_NNNN.svg     additional key pages if there are > 20 entries
+    - tactile.json          sidecar: key table, braille, BANA metadata
+    - grid.npy              60×40 binary pin-grid matrix (diagram only)
+    - grid.png              debug visualisation of the pin grid
+    - layout_debug.svg      raw Graphviz layout for visual inspection
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ import numpy as np
 from tactile.ir import load_and_validate
 from tactile.layout import compute_layout
 from tactile.svg_assembly import assemble
-from tactile.legend import render_legend
+from tactile.legend import render_legend_pages
 from tactile.rasterize import rasterize, grid_to_debug_image
 
 
@@ -46,7 +47,6 @@ def run(ir_path: str | Path, output_dir: str | Path) -> None:
     layout = compute_layout(flowchart)
     print(f"  Graph: {layout.graph_width:.2f} x {layout.graph_height:.2f} inches")
 
-    # Save debug layout SVG.
     if hasattr(layout, "_debug_svg"):
         (output_dir / "layout_debug.svg").write_text(layout._debug_svg)
 
@@ -55,28 +55,27 @@ def run(ir_path: str | Path, output_dir: str | Path) -> None:
     print("[Stage 4] Assembling structural SVG...")
     dwg, braille_labels, sidecar = assemble(flowchart, layout)
 
-    # Write SVG.
     svg_path = output_dir / "diagram.svg"
     dwg.saveas(str(svg_path), pretty=True)
     print(f"  -> {svg_path}")
 
-    # Write sidecar JSON.
     json_path = output_dir / "tactile.json"
     json_path.write_text(json.dumps(sidecar, indent=2, ensure_ascii=False))
     print(f"  -> {json_path}")
 
-    # Stage 5: Legend SVG.
-    print("[Stage 5] Rendering legend...")
-    legend_dwg = render_legend(braille_labels)
-    legend_path = output_dir / "legend.svg"
-    legend_dwg.saveas(str(legend_path), pretty=True)
-    print(f"  -> {legend_path}")
+    # Stage 5: Key SVG pages (BANA: "Key", not "Legend"; embosser document).
+    print("[Stage 5] Rendering key (BANA-compliant, embosser document)...")
+    key_pages = render_legend_pages(braille_labels)
+    for page_idx, page_dwg in enumerate(key_pages, start=1):
+        key_path = output_dir / f"key_page_{page_idx:04d}.svg"
+        page_dwg.saveas(str(key_path), pretty=True)
+        print(f"  -> {key_path}")
 
-    # Print legend table.
-    print(f"\n  {'#':<4} {'Label':<12} {'Braille'}")
-    print(f"  {'-' * 36}")
+    # Console summary table.
+    print(f"\n  {'#':<4} {'Label':<20} {'Braille'}")
+    print(f"  {'-' * 50}")
     for bl in braille_labels:
-        print(f"  {bl.legend_number:<4} {bl.print_text:<12} {bl.braille_text}")
+        print(f"  {bl.legend_number:<4} {bl.print_text:<20} {bl.braille_text}")
 
     # Stage 6: Pin-grid rasterization.
     print("\n[Stage 6] Rasterizing to 60x40 pin grid...")
